@@ -10,7 +10,8 @@ use crate::{
     },
     ActixAdminMenuElement,
 };
-use actix_web::{web, Route};
+use axum::routing::{get, MethodRouter};
+use axum::Router;
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 
@@ -21,10 +22,10 @@ use std::fs;
 /// now just a re-export of the inherent methods and does not need to be
 /// brought into scope.
 pub struct ActixAdminBuilder {
-    pub scopes: HashMap<String, actix_web::Scope>,
-    pub custom_routes: Vec<(String, Route)>,
+    pub scopes: HashMap<String, Router>,
+    pub custom_routes: Vec<(String, MethodRouter)>,
     pub actix_admin: ActixAdmin,
-    pub custom_index: Option<Route>,
+    pub custom_index: Option<MethodRouter>,
 }
 
 /// Compatibility trait for pre-0.8 code that did
@@ -34,7 +35,7 @@ pub struct ActixAdminBuilder {
 /// user code keeps compiling. New code should not implement it.
 pub trait ActixAdminBuilderTrait {
     fn new(configuration: ActixAdminConfiguration) -> Self;
-    fn get_scope(self) -> actix_web::Scope;
+    fn get_scope(self) -> Router;
     fn get_actix_admin(&self) -> ActixAdmin;
 }
 
@@ -42,7 +43,7 @@ impl ActixAdminBuilderTrait for ActixAdminBuilder {
     fn new(configuration: ActixAdminConfiguration) -> Self {
         Self::new(configuration)
     }
-    fn get_scope(self) -> actix_web::Scope {
+    fn get_scope(self) -> Router {
         Self::get_scope(self)
     }
     fn get_actix_admin(&self) -> ActixAdmin {
@@ -79,25 +80,31 @@ impl ActixAdminBuilder {
         view_model: &ActixAdminViewModel,
         category_name: &str,
     ) {
+        let e = E::get_entity_name();
         self.scopes.insert(
             E::get_entity_name(),
-            web::scope(&format!("/{}", E::get_entity_name()))
-                .route("/list", web::get().to(list::<E>))
-                .route("/export_csv", web::get().to(export_csv::<E>))
-                .route("/create", web::get().to(create_get::<E>))
-                .route("/search", web::get().to(search::<E>))
-                .route("/create", web::post().to(create_post::<E>))
-                .route("/edit/{id}", web::get().to(edit_get::<E>))
-                .route("/edit/{id}", web::post().to(edit_post::<E>))
-                .route("/delete", web::delete().to(delete_many::<E>))
-                .route("/delete/{id}", web::delete().to(delete::<E>))
-                .route("/show/{id}", web::get().to(show::<E>))
-                .route("/file/{id}/{column_name}", web::get().to(download::<E>))
+            Router::new()
+                .route(&format!("/{e}/list"), get(list::<E>))
+                .route(&format!("/{e}/export_csv"), get(export_csv::<E>))
+                .route(&format!("/{e}/search"), get(search::<E>))
                 .route(
-                    "/file/{id}/{column_name}",
-                    web::delete().to(delete_file::<E>),
+                    &format!("/{e}/create"),
+                    get(create_get::<E>).post(create_post::<E>),
                 )
-                .default_service(web::to(not_found)),
+                .route(
+                    &format!("/{e}/edit/{{id}}"),
+                    get(edit_get::<E>).post(edit_post::<E>),
+                )
+                .route(&format!("/{e}/delete"), axum::routing::delete(delete_many::<E>))
+                .route(
+                    &format!("/{e}/delete/{{id}}"),
+                    axum::routing::delete(delete::<E>),
+                )
+                .route(&format!("/{e}/show/{{id}}"), get(show::<E>))
+                .route(
+                    &format!("/{e}/file/{{id}}/{{column_name}}"),
+                    get(download::<E>).delete(delete_file::<E>),
+                ),
         );
 
         if let Err(e) = fs::create_dir_all(format!(
@@ -127,7 +134,7 @@ impl ActixAdminBuilder {
             .insert(E::get_entity_name(), view_model.clone());
     }
 
-    pub fn add_custom_handler_for_index(&mut self, route: Route) {
+    pub fn add_custom_handler_for_index(&mut self, route: MethodRouter) {
         self.custom_index = Some(route);
     }
 
@@ -155,13 +162,13 @@ impl ActixAdminBuilder {
         // action for this entity, so entities that never opt in don't have
         // to satisfy the ActixAdminBulkActionDispatch bound.
         if is_first_action {
-            let scope = self
-                .scopes
-                .remove(&entity_name)
-                .unwrap_or_else(|| web::scope(&format!("/{}", entity_name)));
+            let scope = self.scopes.remove(&entity_name).unwrap_or_default();
             self.scopes.insert(
-                entity_name,
-                scope.route("/action/{name}", web::post().to(bulk_action::<E>)),
+                entity_name.clone(),
+                scope.route(
+                    &format!("/{entity_name}/action/{{name}}"),
+                    axum::routing::post(bulk_action::<E>),
+                ),
             );
         }
     }
@@ -170,7 +177,7 @@ impl ActixAdminBuilder {
         &mut self,
         menu_element_name: &str,
         path: &str,
-        route: Route,
+        route: MethodRouter,
         add_to_menu: bool,
         category_name: &str,
     ) {
@@ -205,7 +212,7 @@ impl ActixAdminBuilder {
         category_name: &str,
     ) {
         self.custom_routes
-            .push((path.to_string(), web::get().to(display_card_grid)));
+            .push((path.to_string(), get(display_card_grid)));
         self.actix_admin
             .card_grids
             .insert(path.replace("/", ""), elements);
@@ -224,13 +231,13 @@ impl ActixAdminBuilder {
         &mut self,
         menu_element_name: &str,
         path: &str,
-        route: Route,
+        route: MethodRouter,
         add_to_menu: bool,
     ) {
         self.add_custom_handler_to_category(menu_element_name, path, route, add_to_menu, "");
     }
 
-    pub fn add_support_handler(&mut self, arg: &str, support: Route) {
+    pub fn add_support_handler(&mut self, arg: &str, support: MethodRouter) {
         self.custom_routes.push((arg.to_string(), support));
         self.actix_admin.support_path = Some(arg.replace("/", ""));
     }
@@ -239,7 +246,7 @@ impl ActixAdminBuilder {
         &mut self,
         menu_element_name: &str,
         path: &str,
-        route: Route,
+        route: MethodRouter,
         add_to_menu: bool,
     ) {
         self.add_custom_handler_for_entity_in_category::<E>(
@@ -255,7 +262,7 @@ impl ActixAdminBuilder {
         &mut self,
         menu_element_name: &str,
         path: &str,
-        route: Route,
+        route: MethodRouter,
         category_name: &str,
         add_to_menu: bool,
     ) {
@@ -266,11 +273,10 @@ impl ActixAdminBuilder {
         };
 
         let entity_name = E::get_entity_name();
-        let scope = self
-            .scopes
-            .remove(&entity_name)
-            .unwrap_or_else(|| web::scope(&format!("/{}", entity_name)));
-        self.scopes.insert(entity_name, scope.route(path, route));
+        let scope = self.scopes.remove(&entity_name).unwrap_or_default();
+        let entity_path = format!("/{entity_name}{path}");
+        self.scopes
+            .insert(entity_name, scope.route(&entity_path, route));
 
         if add_to_menu {
             if let Some(entity_list) = self.actix_admin.entity_names.get_mut(category_name) {
@@ -281,19 +287,45 @@ impl ActixAdminBuilder {
         }
     }
 
-    pub fn get_scope(self) -> actix_web::Scope {
-        let index_handler = self.custom_index.unwrap_or_else(|| web::get().to(index));
-        let mut admin_scope = web::scope(self.actix_admin.configuration.base_path)
-            .route("/", index_handler)
-            .default_service(web::to(not_found));
+    /// Build the admin [`Router`], already nested under
+    /// [`ActixAdminConfiguration::base_path`].
+    ///
+    /// Unlike the actix-web version (which returned a `Scope` the caller had
+    /// to hand to `App::service`), the returned value is a self-contained
+    /// `Router` that the caller merges into their application router. Both
+    /// [`ActixAdmin`] (as `Arc<ActixAdmin>`) and the `DatabaseConnection`
+    /// must be supplied as `Extension` layers, the same way they were
+    /// supplied as `app_data` before.
+    pub fn get_scope(self) -> Router {
+        let index_handler = self.custom_index.unwrap_or_else(|| get(index));
+        let mut admin_router = Router::new().route("/", index_handler);
 
         for (_, scope) in self.scopes {
-            admin_scope = admin_scope.service(scope);
+            admin_router = admin_router.merge(scope);
         }
         for (path, route) in self.custom_routes {
-            admin_scope = admin_scope.route(&path, route);
+            admin_router = admin_router.route(&path, route);
         }
-        admin_scope
+
+        // actix's `Scope::default_service` answered both unknown paths *and*
+        // known paths hit with an unsupported method. axum splits those into
+        // two hooks, so both are wired to `not_found` to keep the status and
+        // body identical. `method_not_allowed_fallback` only applies to
+        // routes registered before it, hence the placement here.
+        admin_router = admin_router
+            .fallback(not_found)
+            .method_not_allowed_fallback(not_found);
+
+        // Nest under `{base_path}/`, not `{base_path}`: axum rewrites a nested
+        // `"/"` route to the bare prefix, which would serve the index at
+        // `/admin` instead of `/admin/`. A trailing-slash prefix keeps the
+        // index at `{base_path}/` and every other route unchanged. The bare
+        // `{base_path}` is then claimed explicitly so the whole prefix belongs
+        // to the admin, as it did with actix's `Scope`.
+        let base_path = self.actix_admin.configuration.base_path;
+        Router::new()
+            .route(base_path, axum::routing::any(not_found))
+            .nest(&format!("{base_path}/"), admin_router)
     }
 
     pub fn get_actix_admin(&self) -> ActixAdmin {

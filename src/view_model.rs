@@ -6,8 +6,8 @@ use std::collections::HashMap;
 
 use crate::ActixAdminError;
 use crate::{model::ActixAdminModelFilterType, ActixAdminModel, SortOrder};
-use actix_session::Session;
 use std::convert::From;
+use tower_sessions::Session;
 pub struct ActixAdminViewModelParams {
     pub page: Option<u64>,
     pub entities_per_page: Option<u64>,
@@ -24,16 +24,19 @@ pub struct ActixAdminViewModelParams {
 /// letting an entity be keyed by `i32`, `i64`, `String`, `uuid::Uuid`, ...
 /// as long as the type satisfies the four ubiquitous requirements:
 ///
-/// * `DeserializeOwned` — needed by `actix_web::web::Path<Id>`.
+/// * `DeserializeOwned` — needed by `axum::extract::Path<Id>`.
 /// * `FromStr`         — needed to parse ids out of form bodies (bulk delete).
 /// * `Display`         — needed to render ids into URLs and templates.
 /// * `Clone + 'static` — needed by the generated Sea-ORM queries.
+/// * `Send`            — required by `axum::extract::Path`, which only
+///   extracts `T: DeserializeOwned + Send`. Every practical key type (`i32`,
+///   `i64`, `String`, `uuid::Uuid`) already satisfies it.
 pub trait ActixAdminPrimaryKey:
-    serde::de::DeserializeOwned + std::str::FromStr + std::fmt::Display + Clone + 'static
+    serde::de::DeserializeOwned + std::str::FromStr + std::fmt::Display + Clone + Send + 'static
 {
 }
 impl<T> ActixAdminPrimaryKey for T where
-    T: serde::de::DeserializeOwned + std::str::FromStr + std::fmt::Display + Clone + 'static
+    T: serde::de::DeserializeOwned + std::str::FromStr + std::fmt::Display + Clone + Send + 'static
 {
 }
 

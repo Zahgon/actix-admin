@@ -1,24 +1,29 @@
-use actix_session::Session;
-use actix_web::{error, web, Error, HttpResponse};
+use axum::http::StatusCode;
+use axum::response::Response;
+use axum::Extension;
+use std::sync::Arc;
 use tera::Context;
+use tower_sessions::Session;
 
 use crate::prelude::*;
 
+use super::helpers::html_response;
 use super::add_auth_context;
 
-pub fn get_admin_ctx(session: Session, data: &web::Data<ActixAdmin>) -> Context {
-    let actix_admin = data.get_ref();
-
+pub async fn get_admin_ctx(session: &Session, actix_admin: &ActixAdmin) -> Context {
     let mut ctx = Context::new();
     ctx.insert("entity_names", &actix_admin.entity_names);
 
-    add_auth_context(&session, actix_admin, &mut ctx);
+    add_auth_context(session, actix_admin, &mut ctx).await;
 
     ctx
 }
 
-pub async fn index(session: Session, data: web::Data<ActixAdmin>) -> Result<HttpResponse, Error> {
-    let actix_admin = &data.into_inner();
+pub async fn index(
+    session: Session,
+    Extension(actix_admin): Extension<Arc<ActixAdmin>>,
+) -> Result<Response, ActixAdminError> {
+    let actix_admin = &actix_admin;
 
     let mut ctx = Context::new();
     ctx.insert("entity_names", &actix_admin.entity_names);
@@ -27,22 +32,21 @@ pub async fn index(session: Session, data: web::Data<ActixAdmin>) -> Result<Http
         &Vec::<crate::ActixAdminNotification>::new(),
     );
 
-    add_auth_context(&session, actix_admin, &mut ctx);
+    add_auth_context(&session, actix_admin, &mut ctx).await;
 
     let body = actix_admin
         .tera
         .render("index.html", &ctx)
-        .map_err(|e| error::ErrorInternalServerError(format!("Template error: {e}")))?;
-    Ok(HttpResponse::Ok().content_type("text/html").body(body))
+        .map_err(|e| ActixAdminError::internal(format!("Template error: {e}")))?;
+    Ok(html_response(StatusCode::OK, body))
 }
 
-pub async fn not_found(data: web::Data<ActixAdmin>) -> Result<HttpResponse, Error> {
-    let body = data
-        .get_ref()
+pub async fn not_found(
+    Extension(actix_admin): Extension<Arc<ActixAdmin>>,
+) -> Result<Response, ActixAdminError> {
+    let body = actix_admin
         .tera
         .render("not_found.html", &Context::new())
-        .map_err(|e| error::ErrorInternalServerError(format!("Template error: {e}")))?;
-    Ok(HttpResponse::NotFound()
-        .content_type("text/html")
-        .body(body))
+        .map_err(|e| ActixAdminError::internal(format!("Template error: {e}")))?;
+    Ok(html_response(StatusCode::NOT_FOUND, body))
 }

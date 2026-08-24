@@ -1,11 +1,12 @@
 use actix_admin::prelude::*;
-use actix_session::Session;
-use actix_web::web;
-use actix_web::web::Bytes;
-use actix_web::Error;
-use actix_web::HttpRequest;
-use actix_web::HttpResponse;
+use axum::body::{Body, Bytes};
+use axum::extract::{Path, RawQuery};
+use axum::http::{header, HeaderMap, Request, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
+use axum::Extension;
 use chrono::Local;
+use std::sync::Arc;
 use sea_orm::prelude::Decimal;
 use sea_orm::{ConnectOptions, DatabaseConnection, EntityTrait, Set};
 
@@ -94,6 +95,23 @@ pub async fn setup_db(create_entities: bool) -> DatabaseConnection {
     db
 }
 
+/// Wrap an admin `Router` with the layers the library expects: `ActixAdmin`
+/// and the `DatabaseConnection` as `Extension`s (the axum equivalent of
+/// actix-web's `app_data`) plus a session store, which the CSRF and auth
+/// paths read from.
+pub fn wrap_admin_router(
+    router: axum::Router,
+    actix_admin: ActixAdmin,
+    conn: sea_orm::DatabaseConnection,
+) -> axum::Router {
+    router
+        .layer(Extension(Arc::new(actix_admin)))
+        .layer(Extension(conn))
+        .layer(tower_sessions::SessionManagerLayer::new(
+            tower_sessions::MemoryStore::default(),
+        ))
+}
+
 #[macro_export]
 macro_rules! create_app (
     ($db: expr, $enable_auth: expr, $tenant_ref: expr, $enable_inline_editing: expr) => ({
@@ -101,36 +119,60 @@ macro_rules! create_app (
         let actix_admin_builder = super::create_actix_admin_builder($enable_auth, $tenant_ref, $enable_inline_editing);
         let actix_admin = actix_admin_builder.get_actix_admin();
 
-        test::init_service(
-            App::new()
-                .app_data(actix_web::web::Data::new(actix_admin))
-                .app_data(actix_web::web::Data::new(conn))
-                .service(actix_admin_builder.get_scope())
+        $crate::test_setup::helper::wrap_admin_router(
+            actix_admin_builder.get_scope(),
+            actix_admin,
+            conn,
         )
-        .await
     });
 );
 
 #[macro_export]
 macro_rules! create_server (
     ($db: expr, $enable_auth: expr, $tenant_ref: expr, $enable_inline_editing: expr) => ({
-        use actix_web::{App, HttpServer};
+        let conn = $db.clone();
+        let actix_admin_builder = create_actix_admin_builder($enable_auth, $tenant_ref, $enable_inline_editing);
+        let actix_admin = actix_admin_builder.get_actix_admin();
 
-        // Create and start the Actix-web server
-        let _server = HttpServer::new(move || {
-            let conn = $db.clone();
-            let actix_admin_builder = create_actix_admin_builder($enable_auth, $tenant_ref, $enable_inline_editing);
-            let actix_admin = actix_admin_builder.get_actix_admin();
+        let app = $crate::test_setup::helper::wrap_admin_router(
+            actix_admin_builder.get_scope(),
+            actix_admin,
+            conn,
+        );
 
-            App::new()
-                .app_data(actix_web::web::Data::new(actix_admin))
-                .app_data(actix_web::web::Data::new(conn))
-                .service(actix_admin_builder.get_scope())
-        }
-        ).bind("127.0.0.1:5555").unwrap().run().await
-        .expect("Failed to run server");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:5555").await.unwrap();
+        axum::serve(listener, app).await.expect("Failed to run server");
     });
 );
+
+pub fn request(method: &str, uri: &str) -> Request<Body> {
+    Request::builder()
+        .method(method)
+        .uri(uri)
+        .body(Body::empty())
+        .unwrap()
+}
+
+/// Sets `Content-Type: application/x-www-form-urlencoded`, which axum's `Form`
+/// extractor requires on non-GET requests.
+pub fn form_request_raw(method: &str, uri: &str, body: String) -> Request<Body> {
+    Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(Body::from(body))
+        .unwrap()
+}
+
+pub fn form_request(method: &str, uri: &str, form: impl serde::Serialize) -> Request<Body> {
+    form_request_raw(method, uri, serde_urlencoded::to_string(form).unwrap())
+}
+
+pub async fn read_body(resp: Response) -> Bytes {
+    axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap()
+}
 
 pub fn create_actix_admin_builder(
     enable_auth: bool,
@@ -164,41 +206,40 @@ pub fn create_actix_admin_builder(
     admin_builder.add_custom_handler_for_entity::<Comment>(
         "Create Comment From Plaintext",
         "/create_post_from_plaintext",
-        web::post().to(create_post_from_plaintext::<Comment>),
+        post(create_post_from_plaintext::<Comment>),
         false,
     );
 
     admin_builder.add_custom_handler_for_entity::<Post>(
         "Create Post From Plaintext",
         "/create_post_from_plaintext",
-        web::post().to(create_post_from_plaintext::<Post>),
+        post(create_post_from_plaintext::<Post>),
         false,
     );
 
     admin_builder.add_custom_handler_for_entity::<SampleWithTenantId>(
         "Create Sample With Tenant Id From Plaintext",
         "/create_post_from_plaintext",
-        web::post().to(create_post_from_plaintext::<SampleWithTenantId>),
+        post(create_post_from_plaintext::<SampleWithTenantId>),
         false,
     );
 
     admin_builder.add_custom_handler_for_entity::<Post>(
         "Edit Post From Plaintext",
         "/edit_post_from_plaintext/{id}",
-        web::post().to(edit_post_from_plaintext::<Post>),
+        post(edit_post_from_plaintext::<Post>),
         false,
     );
 
     admin_builder.add_custom_handler_for_entity::<Comment>(
         "Edit Comment From Plaintext",
         "/edit_post_from_plaintext/{id}",
-        web::post().to(edit_post_from_plaintext::<Comment>),
+        post(edit_post_from_plaintext::<Comment>),
         false,
     );
 
-    let _support_route = admin_builder.add_support_handler("/support", web::get().to(support));
-    let _card_route =
-        admin_builder.add_custom_handler("card", "/card/{id}", web::get().to(card), false);
+    let _support_route = admin_builder.add_support_handler("/support", get(support));
+    let _card_route = admin_builder.add_custom_handler("card", "/card/{id}", get(card), false);
 
     let card_grid: Vec<Vec<String>> = vec![
         vec!["card/1".to_string(), "card/2".to_string()],
@@ -211,46 +252,88 @@ pub fn create_actix_admin_builder(
 
 async fn create_post_from_plaintext<E: ActixAdminViewModelTrait>(
     session: Session,
-    req: HttpRequest,
-    data: web::Data<ActixAdmin>,
-    db: web::Data<DatabaseConnection>,
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+    Extension(actix_admin): Extension<Arc<ActixAdmin>>,
+    Extension(db): Extension<DatabaseConnection>,
     text: String,
-) -> Result<HttpResponse, Error> {
-    let actix_admin = data.get_ref();
-    let model = ActixAdminModel::from(text);
-    create_or_edit_post::<E>(&session, req, db, Ok(model), None::<E::Id>, actix_admin).await
+) -> Result<Response, ActixAdminError> {
+    run_local(async move {
+        let model = ActixAdminModel::from(text);
+        create_or_edit_post::<E>(
+            &session,
+            &headers,
+            &raw_query.unwrap_or_default(),
+            &db,
+            Ok(model),
+            None::<E::Id>,
+            &actix_admin,
+        )
+        .await
+    })
 }
 
 async fn edit_post_from_plaintext<E: ActixAdminViewModelTrait>(
     session: Session,
-    req: HttpRequest,
-    data: web::Data<ActixAdmin>,
-    db: web::Data<DatabaseConnection>,
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+    Extension(actix_admin): Extension<Arc<ActixAdmin>>,
+    Extension(db): Extension<DatabaseConnection>,
+    Path(id): Path<E::Id>,
     text: String,
-    id: web::Path<E::Id>,
-) -> Result<HttpResponse, Error> {
-    let actix_admin = data.get_ref();
-    let model = ActixAdminModel::from(text);
-    create_or_edit_post::<E>(
-        &session,
-        req,
-        db,
-        Ok(model),
-        Some(id.into_inner()),
-        actix_admin,
-    )
-    .await
+) -> Result<Response, ActixAdminError> {
+    run_local(async move {
+        let model = ActixAdminModel::from(text);
+        create_or_edit_post::<E>(
+            &session,
+            &headers,
+            &raw_query.unwrap_or_default(),
+            &db,
+            Ok(model),
+            Some(id),
+            &actix_admin,
+        )
+        .await
+    })
 }
 
-async fn support() -> Result<HttpResponse, Error> {
+async fn support() -> Response {
     let resp = "<div id=\"support_content\">SupportDiv</div>";
-    Ok(HttpResponse::Ok().content_type("text/html").body(resp))
+    (StatusCode::OK, [(header::CONTENT_TYPE, "text/html")], resp).into_response()
 }
 
-async fn card(id: web::Path<i32>) -> Result<HttpResponse, Error> {
+async fn card(Path(id): Path<i32>) -> Response {
     let resp = format!("<div class=\"card-content\">Card{}</div>", id);
-    Ok(HttpResponse::Ok().content_type("text/html").body(resp))
+    (StatusCode::OK, [(header::CONTENT_TYPE, "text/html")], resp).into_response()
 }
+/// Builds an admin router with CSRF **enabled** and a single `Post` entity,
+/// wrapped with the session store. Used by the CSRF seam test to assert that a
+/// non-multipart write POST is rejected by the CSRF check (403) rather than by
+/// the multipart body parser (400).
+pub fn create_csrf_admin_router(conn: DatabaseConnection) -> axum::Router {
+    let post_view_model = ActixAdminViewModel::from(Post);
+
+    let configuration = ActixAdminConfiguration {
+        enable_auth: false,
+        user_tenant_ref: None,
+        user_is_logged_in: None,
+        login_link: None,
+        logout_link: None,
+        file_upload_directory: "./file_uploads",
+        navbar_title: "test",
+        base_path: "/admin",
+        custom_css_paths: None,
+        custom_js_paths: None,
+        enable_csrf: true,
+    };
+
+    let mut admin_builder = ActixAdminBuilder::new(configuration);
+    admin_builder.add_entity::<Post>(&post_view_model);
+    let actix_admin = admin_builder.get_actix_admin();
+
+    wrap_admin_router(admin_builder.get_scope(), actix_admin, conn)
+}
+
 pub trait BodyTest {
     #[allow(dead_code)]
     fn as_str(&self) -> &str;

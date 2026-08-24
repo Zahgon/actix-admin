@@ -6,22 +6,20 @@ mod verify_tenant_ref {
     extern crate serde_derive;
     use super::create_app;
     use super::BodyTest;
+    use super::{form_request, read_body, request};
     use actix_admin::prelude::*;
-    use actix_web::body::to_bytes;
-    use actix_web::http::header::ContentType;
-    use actix_web::test;
-    use actix_web::App;
     use sea_orm::DatabaseConnection;
     use sea_orm::EntityTrait;
     use sea_orm::PaginatorTrait;
     use serde_derive::Serialize;
+    use tower::ServiceExt;
 
     // This test should only return entities that belong to tenant 1
     fn tenant_ref_fn(_session: &Session) -> Option<i32> {
         Some(1)
     }
 
-    #[actix_web::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn get_sample_list_page() {
         let db = super::setup_db(true).await;
         let page = 5;
@@ -37,7 +35,7 @@ mod verify_tenant_ref {
         test_response_contains(url.as_str(), &db, vec!["TestTenant0".to_string()], false).await;
     }
 
-    #[actix_web::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn get_sample_show_page() {
         let db = super::setup_db(true).await;
         for i in 1..20 {
@@ -66,10 +64,10 @@ mod verify_tenant_ref {
     ) {
         let app = create_app!(db, false, Some(tenant_ref_fn), false);
 
-        let req = test::TestRequest::get().uri(url).to_request();
+        let req = request("GET", url);
 
-        let resp = test::call_service(&app, req).await;
-        let body = to_bytes(resp.into_body()).await.unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let body = read_body(resp).await;
         let body = body.as_str();
 
         for element in elements_to_verify {
@@ -91,7 +89,7 @@ mod verify_tenant_ref {
         }
     }
 
-    #[actix_web::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn sample_with_tenant_id_delete_own_tenant() {
         let db = super::setup_db(true).await;
         let app = create_app!(db, false, Some(tenant_ref_fn), false);
@@ -107,8 +105,8 @@ mod verify_tenant_ref {
             super::SampleWithTenantId::get_entity_name(),
             id
         );
-        let req = test::TestRequest::delete().uri(&uri).to_request();
-        let resp = test::call_service(&app, req).await;
+        let req = request("DELETE", &uri);
+        let resp = app.oneshot(req).await.unwrap();
 
         // Delete should fail due to wrong tenant
         assert!(resp.status().is_success());
@@ -120,7 +118,7 @@ mod verify_tenant_ref {
         assert!(entity_after_delete.is_none());
     }
 
-    #[actix_web::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn sample_with_tenant_id_delete_other_tenant() {
         let db = super::setup_db(true).await;
         let app = create_app!(db, false, Some(tenant_ref_fn), false);
@@ -136,8 +134,8 @@ mod verify_tenant_ref {
             super::SampleWithTenantId::get_entity_name(),
             id
         );
-        let req = test::TestRequest::delete().uri(&uri).to_request();
-        let resp = test::call_service(&app, req).await;
+        let req = request("DELETE", &uri);
+        let resp = app.oneshot(req).await.unwrap();
 
         // Delete should fail due to wrong tenant
         assert!(!resp.status().is_success());
@@ -156,7 +154,7 @@ mod verify_tenant_ref {
         text: &'static str,
     }
 
-    #[actix_web::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn sample_with_tenant_id_create() {
         let db = super::setup_db(false).await;
         let app = create_app!(db, false, Some(tenant_ref_fn), false);
@@ -167,18 +165,16 @@ mod verify_tenant_ref {
             text: "test",
         };
 
-        let req = test::TestRequest::post()
-            .insert_header(ContentType::form_url_encoded())
-            .uri(
-                format!(
-                    "/admin/{}/create_post_from_plaintext",
-                    super::SampleWithTenantId::get_entity_name()
-                )
-                .as_ref(),
+        let req = form_request(
+            "POST",
+            format!(
+                "/admin/{}/create_post_from_plaintext",
+                super::SampleWithTenantId::get_entity_name()
             )
-            .set_form(model.clone())
-            .to_request();
-        let resp = test::call_service(&app, req).await;
+            .as_ref(),
+            model.clone(),
+        );
+        let resp = app.oneshot(req).await.unwrap();
 
         assert!(resp.status().is_redirection());
 

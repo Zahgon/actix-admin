@@ -1,9 +1,17 @@
 use crate::admin_prelude;
 use crate::prelude::*;
-use actix_session::Session;
-use actix_web::{error, web, Error, HttpRequest, HttpResponse};
+use axum::body::Body;
+use axum::extract::{Path, RawQuery};
+use axum::http::{HeaderMap, Request, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::Extension;
 use sea_orm::DatabaseConnection;
+use std::sync::Arc;
+use tower::ServiceExt;
+use tower_http::services::ServeFile;
+use tower_sessions::Session;
 
+use super::helpers::{html_response, run_local};
 use super::{AdminAction, RoutePrelude};
 
 /// Returns the field descriptor if `column_name` refers to a `FileUpload`
@@ -12,7 +20,7 @@ use super::{AdminAction, RoutePrelude};
 fn file_upload_field<'a>(
     view_model: &'a ActixAdminViewModel,
     column_name: &str,
-) -> Result<&'a ActixAdminViewModelField, Error> {
+) -> Result<&'a ActixAdminViewModelField, ActixAdminError> {
     view_model
         .fields
         .iter()
@@ -24,30 +32,58 @@ fn file_upload_field<'a>(
                 )
         })
         .ok_or_else(|| {
-            error::ErrorBadRequest(format!("'{column_name}' is not a file upload field"))
+            ActixAdminError::bad_request(format!("'{column_name}' is not a file upload field"))
         })
 }
 
 pub async fn download<E: ActixAdminViewModelTrait>(
-    req: HttpRequest,
     session: Session,
-    data: web::Data<ActixAdmin>,
-    db: web::Data<DatabaseConnection>,
-    params: web::Path<(E::Id, String)>,
-) -> Result<HttpResponse, Error> {
-    let actix_admin = &data.into_inner();
-    let db = &db.into_inner();
-    let ctx = admin_prelude!(&session, &req, actix_admin, RoutePrelude::view(), E);
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+    Extension(actix_admin): Extension<Arc<ActixAdmin>>,
+    Extension(db): Extension<DatabaseConnection>,
+    Path((id, column_name)): Path<(E::Id, String)>,
+) -> Result<Response, ActixAdminError> {
+    run_local(download_inner::<E>(
+        session,
+        headers,
+        raw_query,
+        actix_admin,
+        db,
+        id,
+        column_name,
+    ))
+}
 
-    let (id, column_name) = params.into_inner();
+async fn download_inner<E: ActixAdminViewModelTrait>(
+    session: Session,
+    headers: HeaderMap,
+    raw_query: Option<String>,
+    actix_admin: Arc<ActixAdmin>,
+    db: DatabaseConnection,
+    id: E::Id,
+    column_name: String,
+) -> Result<Response, ActixAdminError> {
+    let actix_admin = &actix_admin;
+    let db = &db;
+    let raw_query = raw_query.unwrap_or_default();
+    let ctx = admin_prelude!(
+        &session,
+        &headers,
+        &raw_query,
+        actix_admin,
+        RoutePrelude::view(),
+        E
+    );
+
     let _field = file_upload_field(ctx.view_model, &column_name)?;
 
     let model = match E::get_entity(db, id, ctx.tenant_ref).await {
         Ok(m) => m,
         Err(e) if e.ty == crate::ActixAdminErrorType::EntityDoesNotExistError => {
-            return Ok(HttpResponse::NotFound().finish());
+            return Ok(StatusCode::NOT_FOUND.into_response());
         }
-        Err(e) => return Err(error::ErrorInternalServerError(e.to_string())),
+        Err(e) => return Err(ActixAdminError::internal(e.to_string())),
     };
 
     let file_name = model
@@ -56,7 +92,7 @@ pub async fn download<E: ActixAdminViewModelTrait>(
         .flatten()
         .unwrap_or_default();
     if file_name.is_empty() {
-        return Ok(HttpResponse::NotFound().finish());
+        return Ok(StatusCode::NOT_FOUND.into_response());
     }
     let safe = crate::model::sanitize_upload_filename(&file_name);
     let file_path = format!(
@@ -64,37 +100,70 @@ pub async fn download<E: ActixAdminViewModelTrait>(
         actix_admin.configuration.file_upload_directory, ctx.entity_name, safe
     );
 
-    match actix_files::NamedFile::open_async(file_path).await {
-        Ok(file) => Ok(file.into_response(&req)),
-        Err(_) => Ok(HttpResponse::NotFound().content_type("text/html").body("")),
+    // `ServeFile` serves the fixed path regardless of the request URI, but it
+    // does read `Range` / `If-*` headers off the request, so the caller's
+    // headers are forwarded to keep conditional and ranged downloads working
+    // the way `NamedFile::into_response` did.
+    let mut probe = Request::new(Body::empty());
+    *probe.headers_mut() = headers.clone();
+    let response = ServeFile::new(&file_path)
+        .oneshot(probe)
+        .await
+        .map_err(|e| ActixAdminError::internal(e.to_string()))?;
+
+    if response.status() == StatusCode::NOT_FOUND {
+        return Ok(html_response(StatusCode::NOT_FOUND, String::new()));
     }
+    Ok(response.into_response())
 }
 
 pub async fn delete_file<E: ActixAdminViewModelTrait>(
     session: Session,
-    req: HttpRequest,
-    data: web::Data<ActixAdmin>,
-    db: web::Data<DatabaseConnection>,
-    params: web::Path<(E::Id, String)>,
-) -> Result<HttpResponse, Error> {
-    let actix_admin = &data.into_inner();
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+    Extension(actix_admin): Extension<Arc<ActixAdmin>>,
+    Extension(db): Extension<DatabaseConnection>,
+    Path((id, column_name)): Path<(E::Id, String)>,
+) -> Result<Response, ActixAdminError> {
+    run_local(delete_file_inner::<E>(
+        session,
+        headers,
+        raw_query,
+        actix_admin,
+        db,
+        id,
+        column_name,
+    ))
+}
+
+async fn delete_file_inner<E: ActixAdminViewModelTrait>(
+    session: Session,
+    headers: HeaderMap,
+    raw_query: Option<String>,
+    actix_admin: Arc<ActixAdmin>,
+    db: DatabaseConnection,
+    id: E::Id,
+    column_name: String,
+) -> Result<Response, ActixAdminError> {
+    let actix_admin = &actix_admin;
+    let raw_query = raw_query.unwrap_or_default();
     let ctx = admin_prelude!(
         &session,
-        &req,
+        &headers,
+        &raw_query,
         actix_admin,
         RoutePrelude::write(AdminAction::Edit),
         E
     );
 
-    let (id, column_name) = params.into_inner();
     let view_model_field = file_upload_field(ctx.view_model, &column_name)?;
 
-    let mut model = match E::get_entity(db.get_ref(), id.clone(), ctx.tenant_ref).await {
+    let mut model = match E::get_entity(&db, id.clone(), ctx.tenant_ref).await {
         Ok(m) => m,
         Err(e) if e.ty == crate::ActixAdminErrorType::EntityDoesNotExistError => {
-            return Ok(HttpResponse::NotFound().finish());
+            return Ok(StatusCode::NOT_FOUND.into_response());
         }
-        Err(e) => return Err(error::ErrorInternalServerError(e.to_string())),
+        Err(e) => return Err(ActixAdminError::internal(e.to_string())),
     };
 
     if let Some(file_name) = model
@@ -114,7 +183,7 @@ pub async fn delete_file<E: ActixAdminViewModelTrait>(
     }
     model.values.remove(&column_name);
 
-    let _edit_res = E::edit_entity(db.get_ref(), id, model.clone(), ctx.tenant_ref).await;
+    let _edit_res = E::edit_entity(&db, id, model.clone(), ctx.tenant_ref).await;
 
     let mut tctx = tera::Context::new();
     tctx.insert("model_field", view_model_field);
@@ -124,6 +193,6 @@ pub async fn delete_file<E: ActixAdminViewModelTrait>(
     let body = actix_admin
         .tera
         .render("form_elements/input.html", &tctx)
-        .map_err(error::ErrorInternalServerError)?;
-    Ok(HttpResponse::Ok().content_type("text/html").body(body))
+        .map_err(|e| ActixAdminError::internal(e.to_string()))?;
+    Ok(html_response(StatusCode::OK, body))
 }

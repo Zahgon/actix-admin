@@ -3,17 +3,18 @@ use test_setup::prelude::*;
 
 #[cfg(test)]
 mod post_delete_is_success {
+    use super::{form_request_raw, request};
     use actix_admin::prelude::*;
-    use actix_web::{http::header::ContentType, test, App};
     use itertools::Itertools;
     use sea_orm::{
         sea_query::{Expr, Value},
         ColumnTrait, EntityTrait, QueryFilter,
     };
+    use tower::ServiceExt;
 
     use crate::create_app;
 
-    #[actix_web::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn post_delete() {
         let db = super::setup_db(true).await;
         let app = create_app!(db, false, None, false);
@@ -25,8 +26,8 @@ mod post_delete_is_success {
         assert!(entity.is_some());
 
         let uri = format!("/admin/post/delete/{}", id);
-        let req = test::TestRequest::delete().uri(&uri).to_request();
-        let resp = test::call_service(&app, req).await;
+        let req = request("DELETE", &uri);
+        let resp = app.clone().oneshot(req).await.unwrap();
 
         // Delete should fail due to foreign key
         assert!(!resp.status().is_success());
@@ -38,8 +39,8 @@ mod post_delete_is_success {
         assert_eq!(comment_delete_res.rows_affected, 1);
 
         let uri = format!("/admin/post/delete/{}", id);
-        let req = test::TestRequest::delete().uri(&uri).to_request();
-        let resp = test::call_service(&app, req).await;
+        let req = request("DELETE", &uri);
+        let resp = app.clone().oneshot(req).await.unwrap();
         assert!(resp.status().is_success());
 
         let entity_after_delete = super::test_setup::Post::find_by_id(id)
@@ -49,7 +50,7 @@ mod post_delete_is_success {
         assert!(entity_after_delete.is_none());
     }
 
-    #[actix_web::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn comment_delete() {
         let db = super::setup_db(true).await;
         let app = create_app!(db, false, None, false);
@@ -61,8 +62,8 @@ mod post_delete_is_success {
         assert!(entity.is_some());
 
         let uri = format!("/admin/comment/delete/{}", id);
-        let req = test::TestRequest::delete().uri(&uri).to_request();
-        let resp = test::call_service(&app, req).await;
+        let req = request("DELETE", &uri);
+        let resp = app.clone().oneshot(req).await.unwrap();
         assert!(resp.status().is_success());
 
         let entity_after_delete = super::test_setup::Comment::find_by_id(id)
@@ -72,7 +73,7 @@ mod post_delete_is_success {
         assert!(entity_after_delete.is_none());
     }
 
-    #[actix_web::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn comment_delete_many() {
         let db = super::setup_db(true).await;
         let app = create_app!(db, false, None, false);
@@ -86,13 +87,9 @@ mod post_delete_is_success {
         }
 
         let payload: String = ids.iter().map(|i| format!("ids={}", i)).join("&");
-        let ids_payload = payload.into_bytes();
-        let req = test::TestRequest::delete()
-            .uri("/admin/comment/delete")
-            .insert_header(ContentType::form_url_encoded())
-            .set_payload(ids_payload)
-            .to_request();
-        let resp = test::call_service(&app, req).await;
+        let ids_payload = payload;
+        let req = form_request_raw("DELETE", "/admin/comment/delete", ids_payload);
+        let resp = app.clone().oneshot(req).await.unwrap();
         assert!(resp.status().is_redirection());
 
         for id in ids {
@@ -104,7 +101,7 @@ mod post_delete_is_success {
         }
     }
 
-    #[actix_web::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn post_delete_many() {
         let db = super::setup_db(true).await;
         let app = create_app!(db, false, None, false);
@@ -118,13 +115,9 @@ mod post_delete_is_success {
         }
 
         let payload: String = ids.iter().map(|i| format!("ids={}", i)).join("&");
-        let ids_payload = payload.into_bytes();
-        let req = test::TestRequest::delete()
-            .uri("/admin/post/delete")
-            .insert_header(ContentType::form_url_encoded())
-            .set_payload(ids_payload.clone())
-            .to_request();
-        let resp = test::call_service(&app, req).await;
+        let ids_payload = payload;
+        let req = form_request_raw("DELETE", "/admin/post/delete", ids_payload.clone());
+        let resp = app.clone().oneshot(req).await.unwrap();
 
         // Fails because of FK constraints
         assert!(resp.status().is_server_error());
@@ -141,12 +134,8 @@ mod post_delete_is_success {
         assert!(update_res.is_ok());
 
         // Delete again
-        let req = test::TestRequest::delete()
-            .uri("/admin/post/delete")
-            .insert_header(ContentType::form_url_encoded())
-            .set_payload(ids_payload)
-            .to_request();
-        let resp = test::call_service(&app, req).await;
+        let req = form_request_raw("DELETE", "/admin/post/delete", ids_payload);
+        let resp = app.clone().oneshot(req).await.unwrap();
 
         // Should not fail anymore and redirect correctly
         assert!(resp.status().is_redirection());

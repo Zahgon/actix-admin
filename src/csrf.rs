@@ -1,28 +1,28 @@
 //! CSRF protection helpers.
 //!
 //! actix-admin protects every state-changing route (POST/PUT/PATCH/DELETE)
-//! with a per-session CSRF token stored in the `actix-session` cookie.
+//! with a per-session CSRF token stored in the `tower-sessions` session.
 //!
 //! * [`csrf_token_for`] returns the current token, creating one the first
 //!   time it is called for a session.
 //! * [`verify_csrf`] extracts the token from either the `X-CSRF-Token`
 //!   header (used by HTMX) or the `_csrf` query parameter (used by classic
 //!   form posts and multipart uploads, where the form body is streamed
-//!   lazily by `actix-multipart` and cannot be peeked ahead-of-time).
+//!   lazily by the multipart extractor and cannot be peeked ahead-of-time).
 //!
 //! The check can be globally disabled via
 //! [`crate::ActixAdminConfiguration::enable_csrf`] \u2014 in that case
 //! [`verify_csrf`] is a no-op.
 //!
-//! Setup: install a session middleware (e.g. `actix-session::CookieSession`)
-//! **before** the admin scope, exactly like you already need to for auth.
+//! Setup: install a session middleware (e.g. `tower_sessions::SessionManagerLayer`)
+//! **before** the admin router, exactly like you already need to for auth.
 //!
 //! HTMX wiring: `base.html` sets an `htmx:configRequest` listener that
 //! attaches the token as `X-CSRF-Token` on every HTMX call. Non-HTMX forms
 //! also include a hidden `_csrf` input, and delete/action URLs carry the
 //! token as a `_csrf=` query parameter.
-use actix_session::Session;
-use actix_web::HttpRequest;
+use axum::http::HeaderMap;
+use tower_sessions::Session;
 
 use crate::{ActixAdmin, ActixAdminError, ActixAdminErrorType};
 
@@ -31,7 +31,7 @@ pub const CSRF_SESSION_KEY: &str = "_actix_admin_csrf";
 /// Header name checked on every state-changing request.
 pub const CSRF_HEADER: &str = "X-CSRF-Token";
 /// Fallback query-string parameter, used when the header isn't available
-/// (classic multipart form submissions handled by actix-multipart).
+/// (classic multipart form submissions handled by the multipart extractor).
 pub const CSRF_QUERY_PARAM: &str = "_csrf";
 
 /// Marker error type returned by [`verify_csrf`]. Currently equivalent to
@@ -42,26 +42,36 @@ pub type CsrfError = ActixAdminError;
 /// Return the CSRF token for `session`, generating a fresh one if there is
 /// none. Safe to call from any handler; the value is stable for the lifetime
 /// of the session.
-pub fn csrf_token_for(session: &Session) -> Result<String, ActixAdminError> {
-    if let Some(existing) = session.get::<String>(CSRF_SESSION_KEY).unwrap_or(None) {
+pub async fn csrf_token_for(session: &Session) -> Result<String, ActixAdminError> {
+    if let Some(existing) = session
+        .get::<String>(CSRF_SESSION_KEY)
+        .await
+        .unwrap_or(None)
+    {
         return Ok(existing);
     }
     let token = generate_token();
     session
         .insert(CSRF_SESSION_KEY, &token)
+        .await
         .map_err(|e| ActixAdminError::new(ActixAdminErrorType::InternalError, e.to_string()))?;
     Ok(token)
 }
 
-/// Assert that `req` carries a valid CSRF token for `session`. Returns
-/// `Ok(())` when CSRF protection is disabled globally.
+/// Assert that the incoming request carries a valid CSRF token for `session`.
+/// Returns `Ok(())` when CSRF protection is disabled globally.
+///
+/// `headers` and `query` are the request's header map and raw query string,
+/// kept framework-neutral so the check does not depend on a particular
+/// request type.
 ///
 /// The token can be provided either via the `X-CSRF-Token` header (HTMX)
 /// or the `_csrf` query-string parameter (classic forms & multipart).
-pub fn verify_csrf(
+pub async fn verify_csrf(
     actix_admin: &ActixAdmin,
     session: &Session,
-    req: &HttpRequest,
+    headers: &HeaderMap,
+    query: &str,
 ) -> Result<(), ActixAdminError> {
     if !actix_admin.configuration.enable_csrf {
         return Ok(());
@@ -69,6 +79,7 @@ pub fn verify_csrf(
 
     let expected = session
         .get::<String>(CSRF_SESSION_KEY)
+        .await
         .unwrap_or(None)
         .ok_or_else(|| {
             ActixAdminError::new(
@@ -77,14 +88,13 @@ pub fn verify_csrf(
             )
         })?;
 
-    let from_header = req
-        .headers()
+    let from_header = headers
         .get(CSRF_HEADER)
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
 
     let from_query = if from_header.is_none() {
-        form_urlencoded::parse(req.query_string().as_bytes())
+        form_urlencoded::parse(query.as_bytes())
             .find(|(k, _)| k == CSRF_QUERY_PARAM)
             .map(|(_, v)| v.into_owned())
     } else {

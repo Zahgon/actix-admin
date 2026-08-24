@@ -22,10 +22,10 @@ pub use bulk_action::{bulk_action, ActixAdminBulkActionDispatch};
 pub mod query;
 pub use query::{parse_filters_from_query, ListQuery, Params};
 
-mod helpers;
+pub(crate) mod helpers;
 pub use helpers::{
     add_auth_context, begin_route, forbid_if_denied, render_create_or_edit_form, render_template,
-    render_unauthorized, user_can_access_page, user_can_perform, validate_sort_by,
+    render_unauthorized, run_local, user_can_access_page, user_can_perform, validate_sort_by,
     view_model_or_500, AdminAction, RouteCtx, RoutePrelude,
 };
 

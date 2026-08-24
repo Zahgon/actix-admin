@@ -2,8 +2,8 @@ use crate::view_model::{
     ActixAdminFilterOperator, ActixAdminViewModelFilter, ActixAdminViewModelParams,
 };
 use crate::{ActixAdminError, ActixAdminErrorType, ActixAdminViewModelField};
-use actix_multipart::Multipart;
 use async_trait::async_trait;
+use axum::extract::Multipart;
 use chrono::{NaiveDate, NaiveDateTime};
 use futures_util::stream::StreamExt as _;
 use sea_orm::{DatabaseConnection, EntityTrait};
@@ -15,9 +15,10 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Maximum total upload size (default 25MB). Individual deployments should
-/// enforce their own limits via `actix_multipart::form::MultipartFormConfig`
-/// but this provides a defensive per-field cap so that a single field cannot
-/// exhaust memory in `create_from_payload`.
+/// enforce their own limits via a body-size limit layer (e.g.
+/// `tower_http::limit::RequestBodyLimitLayer`) but this provides a defensive
+/// per-field cap so that a single field cannot exhaust memory in
+/// `create_from_payload`.
 pub const DEFAULT_MAX_FIELD_SIZE_BYTES: usize = 25 * 1024 * 1024;
 
 /// Sanitize a user-provided filename so that it can never traverse outside the
@@ -254,8 +255,14 @@ impl ActixAdminModel {
     ) -> Result<ActixAdminModel, ActixAdminError> {
         let mut hashmap = HashMap::<String, String>::new();
 
-        while let Some(item) = payload.next().await {
-            let mut field = item?;
+        while let Some(mut field) = payload.next_field().await? {
+            // `name`/`file_name` borrow the field immutably, so they have to be
+            // captured before the chunk loop takes it mutably as a `Stream`.
+            let field_name = match field.name() {
+                Some(name) => name.to_string(),
+                None => continue,
+            };
+            let raw_filename = field.file_name().map(str::to_owned);
 
             let mut binary_data: Vec<u8> = Vec::new();
             while let Some(chunk) = field.next().await {
@@ -269,16 +276,8 @@ impl ActixAdminModel {
                 binary_data.extend_from_slice(&chunk);
             }
 
-            let content_disposition = match field.content_disposition() {
-                Some(cd) => cd.clone(),
-                None => continue,
-            };
-            let field_name = match content_disposition.get_name() {
-                Some(name) => name.to_string(),
-                None => continue,
-            };
-
-            if let Some(raw_filename) = content_disposition.get_filename() {
+            if let Some(raw_filename) = raw_filename {
+                let raw_filename = raw_filename.as_str();
                 // Skip empty file uploads silently (browsers submit empty file fields).
                 if raw_filename.is_empty() && binary_data.is_empty() {
                     continue;

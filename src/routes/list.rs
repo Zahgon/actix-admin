@@ -1,20 +1,23 @@
 use crate::prelude::*;
-use actix_web::http::header::ContentDisposition;
-use actix_web::{error, web, Error, HttpRequest, HttpResponse};
+use axum::extract::RawQuery;
+use axum::http::{header, HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::Extension;
 use csv::WriterBuilder;
 use sea_orm::DatabaseConnection;
 use serde_derive::{Deserialize, Serialize};
 use std::fmt;
+use std::sync::Arc;
 use tera::Context;
+use tower_sessions::Session;
 
-use super::helpers::{add_default_context_with_session, SearchParams};
+use super::helpers::{add_default_context_with_session, html_response, run_local, SearchParams};
 use super::{add_auth_context, render_template, validate_sort_by, ListQuery, RoutePrelude};
 use crate::admin_prelude;
 use crate::ActixAdminModel;
 use crate::ActixAdminNotification;
 use crate::ActixAdminViewModel;
 use crate::ActixAdminViewModelTrait;
-use actix_session::Session;
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
 pub enum SortOrder {
@@ -48,14 +51,39 @@ pub fn replace_regex(view_model: &ActixAdminViewModel, models: &mut [ActixAdminM
 
 pub async fn export_csv<E: ActixAdminViewModelTrait>(
     session: Session,
-    req: HttpRequest,
-    data: web::Data<ActixAdmin>,
-    db: web::Data<DatabaseConnection>,
-) -> Result<HttpResponse, Error> {
-    let actix_admin = &data.into_inner();
-    let ctx = admin_prelude!(&session, &req, actix_admin, RoutePrelude::export(), E);
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+    Extension(actix_admin): Extension<Arc<ActixAdmin>>,
+    Extension(db): Extension<DatabaseConnection>,
+) -> Result<Response, ActixAdminError> {
+    run_local(export_csv_inner::<E>(
+        session,
+        headers,
+        raw_query,
+        actix_admin,
+        db,
+    ))
+}
 
-    let query = ListQuery::from_query(req.query_string(), ctx.view_model);
+async fn export_csv_inner<E: ActixAdminViewModelTrait>(
+    session: Session,
+    headers: HeaderMap,
+    raw_query: Option<String>,
+    actix_admin: Arc<ActixAdmin>,
+    db: DatabaseConnection,
+) -> Result<Response, ActixAdminError> {
+    let actix_admin = &actix_admin;
+    let raw_query = raw_query.unwrap_or_default();
+    let ctx = admin_prelude!(
+        &session,
+        &headers,
+        &raw_query,
+        actix_admin,
+        RoutePrelude::export(),
+        E
+    );
+
+    let query = ListQuery::from_query(&raw_query, ctx.view_model);
     validate_sort_by(ctx.view_model, &query.sort_by)?;
 
     let params = query.to_view_model_params(ctx.tenant_ref, false);
@@ -79,7 +107,7 @@ pub async fn export_csv<E: ActixAdminViewModelTrait>(
     fields.insert(0, ctx.view_model.primary_key.clone());
     writer
         .write_record(&fields)
-        .map_err(error::ErrorInternalServerError)?;
+        .map_err(|e| ActixAdminError::internal(e.to_string()))?;
 
     for entity in entities {
         let mut values = vec![entity.primary_key.unwrap_or_default()];
@@ -99,32 +127,59 @@ pub async fn export_csv<E: ActixAdminViewModelTrait>(
         }
         writer
             .write_record(&values)
-            .map_err(error::ErrorInternalServerError)?;
+            .map_err(|e| ActixAdminError::internal(e.to_string()))?;
     }
 
     let body = writer
         .into_inner()
-        .map_err(error::ErrorInternalServerError)?;
-    Ok(HttpResponse::Ok()
-        .content_type("text/csv")
-        .insert_header(ContentDisposition::attachment("export.csv"))
-        .body(body))
+        .map_err(|e| ActixAdminError::internal(e.to_string()))?;
+    Ok((
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "text/csv"),
+            (
+                header::CONTENT_DISPOSITION,
+                "attachment; filename=\"export.csv\"",
+            ),
+        ],
+        body,
+    )
+        .into_response())
 }
 
 pub async fn list<E: ActixAdminViewModelTrait>(
     session: Session,
-    req: HttpRequest,
-    data: web::Data<ActixAdmin>,
-    db: web::Data<DatabaseConnection>,
-) -> Result<HttpResponse, Error> {
-    let actix_admin = &data.into_inner();
-    let route_ctx = admin_prelude!(&session, &req, actix_admin, RoutePrelude::view(), E);
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+    Extension(actix_admin): Extension<Arc<ActixAdmin>>,
+    Extension(db): Extension<DatabaseConnection>,
+) -> Result<Response, ActixAdminError> {
+    run_local(list_inner::<E>(session, headers, raw_query, actix_admin, db))
+}
 
-    let query = ListQuery::from_query(req.query_string(), route_ctx.view_model);
+async fn list_inner<E: ActixAdminViewModelTrait>(
+    session: Session,
+    headers: HeaderMap,
+    raw_query: Option<String>,
+    actix_admin: Arc<ActixAdmin>,
+    db: DatabaseConnection,
+) -> Result<Response, ActixAdminError> {
+    let actix_admin = &actix_admin;
+    let raw_query = raw_query.unwrap_or_default();
+    let route_ctx = admin_prelude!(
+        &session,
+        &headers,
+        &raw_query,
+        actix_admin,
+        RoutePrelude::view(),
+        E
+    );
+
+    let query = ListQuery::from_query(&raw_query, route_ctx.view_model);
     validate_sort_by(route_ctx.view_model, &query.sort_by)?;
 
     let mut ctx = Context::new();
-    add_auth_context(&session, actix_admin, &mut ctx);
+    add_auth_context(&session, actix_admin, &mut ctx).await;
 
     let vm_params = query.to_view_model_params(route_ctx.tenant_ref, true);
     let search_params = SearchParams::from_list_query(&query);
@@ -138,12 +193,11 @@ pub async fn list<E: ActixAdminViewModelTrait>(
             ctx.insert("max_show_page", &1);
             ctx.insert("page", &1);
             ctx.insert("notifications", &[ActixAdminNotification::from(e)]);
-            return Ok(HttpResponse::InternalServerError()
-                .content_type("text/html")
-                .body(
-                    render_template(&actix_admin.tera, "list.html", &ctx)
-                        .map_err(error::ErrorInternalServerError)?,
-                ));
+            return Ok(html_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                render_template(&actix_admin.tera, "list.html", &ctx)
+                    .map_err(|e| ActixAdminError::internal(e.to_string()))?,
+            ));
         }
     };
 
@@ -188,7 +242,7 @@ pub async fn list<E: ActixAdminViewModelTrait>(
 
     add_default_context_with_session(
         &mut ctx,
-        req,
+        &headers,
         route_ctx.view_model,
         route_ctx.entity_name,
         actix_admin,
@@ -213,8 +267,9 @@ pub async fn list<E: ActixAdminViewModelTrait>(
     }
     ctx.insert("viewmodel_filter", &viewmodel_filter);
 
-    Ok(HttpResponse::Ok().content_type("text/html").body(
+    Ok(html_response(
+        StatusCode::OK,
         render_template(&actix_admin.tera, "list.html", &ctx)
-            .map_err(|err| error::ErrorInternalServerError(format!("{err:?}")))?,
+            .map_err(|err| ActixAdminError::internal(format!("{err:?}")))?,
     ))
 }

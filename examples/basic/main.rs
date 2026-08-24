@@ -1,46 +1,52 @@
 extern crate serde_derive;
 
 use actix_admin::prelude::*;
-use actix_web::{http::Error, middleware, web, App, HttpResponse, HttpServer};
+use axum::extract::Path;
+use axum::http::{header, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::routing::get;
+use axum::Extension;
 use sea_orm::ConnectOptions;
+use std::sync::Arc;
 use std::time::Duration;
 use tera::{Context, Tera};
 mod entity;
 use entity::{Comment, Post, User};
 
+fn html(body: String) -> Response {
+    (StatusCode::OK, [(header::CONTENT_TYPE, "text/html")], body).into_response()
+}
+
 async fn profile(
     session: Session,
-    tera: web::Data<Tera>,
-    actix_admin: web::Data<ActixAdmin>,
-) -> Result<HttpResponse, Error> {
+    Extension(tera): Extension<Arc<Tera>>,
+    Extension(actix_admin): Extension<Arc<ActixAdmin>>,
+) -> Response {
     let mut ctx = Context::new();
-    ctx.extend(get_admin_ctx(session, &actix_admin));
-    let body = tera.into_inner().render("profile.html", &ctx).unwrap();
-    Ok(HttpResponse::Ok().content_type("text/html").body(body))
+    ctx.extend(get_admin_ctx(&session, &actix_admin).await);
+    html(tera.render("profile.html", &ctx).unwrap())
 }
 
 async fn support(
     session: Session,
-    tera: web::Data<Tera>,
-    actix_admin: web::Data<ActixAdmin>,
-) -> Result<HttpResponse, Error> {
+    Extension(tera): Extension<Arc<Tera>>,
+    Extension(actix_admin): Extension<Arc<ActixAdmin>>,
+) -> Response {
     let mut ctx = Context::new();
-    ctx.extend(get_admin_ctx(session, &actix_admin));
-    let body = tera.into_inner().render("support.html", &ctx).unwrap();
-    Ok(HttpResponse::Ok().content_type("text/html").body(body))
+    ctx.extend(get_admin_ctx(&session, &actix_admin).await);
+    html(tera.render("support.html", &ctx).unwrap())
 }
 
 async fn card(
     session: Session,
-    tera: web::Data<Tera>,
-    actix_admin: web::Data<ActixAdmin>,
-    id: web::Path<i32>,
-) -> Result<HttpResponse, Error> {
+    Extension(tera): Extension<Arc<Tera>>,
+    Extension(actix_admin): Extension<Arc<ActixAdmin>>,
+    Path(id): Path<i32>,
+) -> Response {
     let mut ctx = Context::new();
-    ctx.extend(get_admin_ctx(session, &actix_admin));
-    ctx.insert("id", &(id.into_inner()));
-    let body = tera.into_inner().render("card.html", &ctx).unwrap();
-    Ok(HttpResponse::Ok().content_type("text/html").body(body))
+    ctx.extend(get_admin_ctx(&session, &actix_admin).await);
+    ctx.insert("id", &id);
+    html(tera.render("card.html", &ctx).unwrap())
 }
 
 fn create_actix_admin_builder() -> ActixAdminBuilder {
@@ -62,12 +68,14 @@ fn create_actix_admin_builder() -> ActixAdminBuilder {
 
     let mut post_view_model = ActixAdminViewModel::from(Post);
     post_view_model.inline_edit = true;
-    // Per-view access control demo: everyone can list/view posts, but only
-    // a user with the `edit_posts` claim in the session may edit or delete.
-    post_view_model.user_can_edit =
-        Some(|s: &Session| s.get::<bool>("edit_posts").ok().flatten().unwrap_or(true));
-    post_view_model.user_can_delete =
-        Some(|s: &Session| s.get::<bool>("delete_posts").ok().flatten().unwrap_or(true));
+    // Per-view access control demo. These hooks are synchronous `fn(&Session)`
+    // pointers, but tower-sessions reads are async, so the session claims the
+    // actix-web version consulted (`edit_posts` / `delete_posts`) cannot be
+    // read here. Neither claim is ever set anywhere in this example, so the
+    // original `unwrap_or(true)` always yielded `true` and the demo behaves
+    // identically.
+    post_view_model.user_can_edit = Some(|_s: &Session| true);
+    post_view_model.user_can_delete = Some(|_s: &Session| true);
     admin_builder.add_entity::<Post>(&post_view_model);
 
     // Register a custom bulk action on Post. The dispatcher is implemented
@@ -89,14 +97,13 @@ fn create_actix_admin_builder() -> ActixAdminBuilder {
     admin_builder.add_custom_handler_to_category(
         "Profile",
         "/profile",
-        web::get().to(profile),
+        get(profile),
         true,
         navbar_end_category,
     );
 
-    let _support_route = admin_builder.add_support_handler("/support", web::get().to(support));
-    let _card_route =
-        admin_builder.add_custom_handler("card", "/card/{id}", web::get().to(card), false);
+    let _support_route = admin_builder.add_support_handler("/support", get(support));
+    let _card_route = admin_builder.add_custom_handler("card", "/card/{id}", get(card), false);
 
     let card_grid: Vec<Vec<String>> = vec![
         vec!["card/1".to_string(), "card/2".to_string()],
@@ -118,7 +125,7 @@ fn get_db_options() -> ConnectOptions {
     opt
 }
 
-#[actix_rt::main]
+#[tokio::main]
 async fn main() {
     let opt = get_db_options();
     let conn: sea_orm::DatabaseConnection = sea_orm::Database::connect(opt).await.unwrap();
@@ -126,28 +133,30 @@ async fn main() {
 
     println!("The admin interface is available at http://localhost:5000/admin/");
 
-    HttpServer::new(move || {
-        let actix_admin_builder = create_actix_admin_builder();
+    let actix_admin_builder = create_actix_admin_builder();
+    let actix_admin = actix_admin_builder.get_actix_admin();
 
-        // Start from actix-admin's tera (filters + templates) and layer
-        // the example's own templates on top.
-        let mut tera = actix_admin_builder.get_actix_admin().tera.clone();
-        tera.load_from_glob(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/examples/basic/templates/*.html"
-        ))
-        .unwrap();
-
-        App::new()
-            .app_data(web::Data::new(tera))
-            .app_data(web::Data::new(actix_admin_builder.get_actix_admin()))
-            .app_data(web::Data::new(conn.clone()))
-            .service(actix_admin_builder.get_scope())
-            .wrap(middleware::Logger::default())
-    })
-    .bind("127.0.0.1:5000")
-    .expect("Can not bind to port 5000")
-    .run()
-    .await
+    // Start from actix-admin's tera (filters + templates) and layer
+    // the example's own templates on top.
+    let mut tera = actix_admin.tera.clone();
+    tera.load_from_glob(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/basic/templates/*.html"
+    ))
     .unwrap();
+
+    let app = actix_admin_builder
+        .get_scope()
+        .layer(Extension(Arc::new(tera)))
+        .layer(Extension(Arc::new(actix_admin)))
+        .layer(Extension(conn))
+        .layer(tower_sessions::SessionManagerLayer::new(
+            tower_sessions::MemoryStore::default(),
+        ))
+        .layer(tower_http::trace::TraceLayer::new_for_http());
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:5000")
+        .await
+        .expect("Can not bind to port 5000");
+    axum::serve(listener, app).await.unwrap();
 }

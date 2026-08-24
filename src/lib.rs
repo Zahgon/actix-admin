@@ -4,12 +4,8 @@
 //!
 //! See the [documentation](https://mgugger.github.io/actix-admin/) at [https://mgugger.github.io/actix-admin/](https://mgugger.github.io/actix-admin/).
 
-use actix_session::Session;
-use actix_web::{
-    error,
-    http::{header::ContentType, StatusCode},
-    HttpResponse,
-};
+use axum::http::{header, StatusCode};
+use axum::response::{IntoResponse, Response};
 use async_trait::async_trait;
 use derive_more::{Display, Error};
 use sea_orm::DatabaseConnection;
@@ -35,7 +31,8 @@ pub mod prelude {
         ActixAdminModelFilterType, ActixAdminModelTrait, ActixAdminModelValidationTrait, FilterFn,
     };
     pub use crate::routes::{
-        bulk_action, create_or_edit_post, get_admin_ctx, ActixAdminBulkActionDispatch, SortOrder,
+        bulk_action, create_or_edit_post, get_admin_ctx, run_local, ActixAdminBulkActionDispatch,
+        SortOrder,
     };
     pub use crate::view_model::{
         ActixAdminBulkAction, ActixAdminFilterOperator, ActixAdminPrimaryKey, ActixAdminViewModel,
@@ -48,8 +45,8 @@ pub mod prelude {
         DeriveActixAdmin, DeriveActixAdminEnumSelectList, DeriveActixAdminModel,
         DeriveActixAdminModelSelectList, DeriveActixAdminViewModel,
     };
-    pub use actix_session::Session;
     pub use async_trait::async_trait;
+    pub use tower_sessions::Session;
 }
 
 use crate::prelude::*;
@@ -86,11 +83,11 @@ pub struct ActixAdminConfiguration {
     pub custom_css_paths: Option<Vec<String>>,
     pub custom_js_paths: Option<Vec<String>>,
     /// When `true` (default), every state-changing route (POST/DELETE/PUT) is
-    /// gated by a CSRF token stored in the actix-session cookie. Templates
+    /// gated by a CSRF token stored in the tower-sessions session. Templates
     /// automatically wire the token into every HTMX request as the
     /// `X-CSRF-Token` header, and inject a hidden `_csrf` input into forms.
     ///
-    /// Requires an `actix-session` middleware to be installed. If your admin
+    /// Requires a `tower-sessions` middleware to be installed. If your admin
     /// deployment is behind a non-cookie-session auth flow and you do not want
     /// this protection (e.g. tests, an isolated intranet), set to `false`.
     pub enable_csrf: bool,
@@ -211,16 +208,11 @@ impl ActixAdminError {
     pub fn internal(msg: impl Into<String>) -> Self {
         Self::new(ActixAdminErrorType::InternalError, msg)
     }
-}
 
-impl error::ResponseError for ActixAdminError {
-    fn error_response(&self) -> HttpResponse {
-        HttpResponse::build(self.status_code())
-            .insert_header(ContentType::html())
-            .body(self.to_string())
-    }
-
-    fn status_code(&self) -> StatusCode {
+    /// HTTP status this error maps to. Inherent method now that the error
+    /// renders itself through axum's [`IntoResponse`] instead of actix-web's
+    /// `ResponseError` trait (which supplied `status_code` before).
+    pub fn status_code(&self) -> StatusCode {
         use ActixAdminErrorType::*;
         match self.ty {
             BadRequest | ValidationErrors => StatusCode::BAD_REQUEST,
@@ -230,6 +222,19 @@ impl error::ResponseError for ActixAdminError {
             InternalError | ListError | CreateError | DeleteError | EditError | DatabaseError
             | UploadError | IoError => StatusCode::INTERNAL_SERVER_ERROR,
         }
+    }
+}
+
+impl IntoResponse for ActixAdminError {
+    fn into_response(self) -> Response {
+        // actix-web's `ContentType::html()` emits `text/html; charset=utf-8`;
+        // reproduce that byte-for-byte so downstream clients see no change.
+        (
+            self.status_code(),
+            [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+            self.to_string(),
+        )
+            .into_response()
     }
 }
 
@@ -248,7 +253,7 @@ macro_rules! impl_from_error {
 impl_from_error! {
     sea_orm::DbErr => DatabaseError,
     std::io::Error => IoError,
-    actix_multipart::MultipartError => UploadError,
+    axum::extract::multipart::MultipartError => UploadError,
     serde_urlencoded::de::Error => BadRequest,
 }
 

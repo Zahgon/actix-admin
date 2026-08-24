@@ -1,11 +1,41 @@
-use actix_session::Session;
 use serde_derive::Deserialize;
 use tera::Context;
+use tower_sessions::Session;
 
 use crate::{prelude::*, ActixAdminNotification};
-use actix_web::{error, Error, HttpRequest, HttpResponse};
+use axum::http::{header, HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
 
 use super::{Params, DEFAULT_ENTITIES_PER_PAGE};
+
+/// Build a `text/html` response with an explicit status, mirroring the
+/// `HttpResponse::build(status).content_type("text/html")` shape the
+/// actix-web handlers used. actix emitted the bare `text/html` token here
+/// (not `text/html; charset=utf-8`), so this does too.
+pub(crate) fn html_response(status: StatusCode, body: String) -> Response {
+    (status, [(header::CONTENT_TYPE, "text/html")], body).into_response()
+}
+
+/// Drive a `!Send` future to completion on the current worker thread and
+/// return its output.
+///
+/// `ActixAdminViewModelTrait` is declared `#[async_trait(?Send)]` (the derive
+/// macro emits `?Send` impls, so the trait cannot be made `Send`), which makes
+/// every future that awaits an entity method `!Send`. actix-web accepted those
+/// directly because its workers are single-threaded; axum's `Handler` requires
+/// `Future: Send`. This is the single bridge between the two: the axum handler
+/// itself stays `Send` because it contains no await points, and the `!Send`
+/// body runs here.
+///
+/// Call this **once** per request, at the outermost handler. Nesting it inside
+/// another `run_local` would re-enter `block_in_place` and is not supported.
+///
+/// Requires a multi-threaded tokio runtime (`block_in_place` panics on the
+/// current-thread scheduler), so tests must use
+/// `#[tokio::test(flavor = "multi_thread")]`.
+pub fn run_local<T>(fut: impl std::future::Future<Output = T>) -> T {
+    tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(fut))
+}
 
 /// The set of gated actions on an entity view. Used by [`user_can_perform`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,19 +137,20 @@ impl RoutePrelude {
 /// * `Ok(Err(resp))` — return `resp` directly (unauthorized rendered
 ///   template)
 /// * `Err(err)`      — propagate `err` (CSRF violation, missing view model)
-pub fn begin_route<'a, E: ActixAdminViewModelTrait>(
+pub async fn begin_route<'a, E: ActixAdminViewModelTrait>(
     session: &Session,
-    req: &HttpRequest,
+    headers: &HeaderMap,
+    query: &str,
     actix_admin: &'a ActixAdmin,
     opts: RoutePrelude,
-) -> Result<Result<RouteCtx<'a>, HttpResponse>, Error> {
+) -> Result<Result<RouteCtx<'a>, Response>, ActixAdminError> {
     let entity_name = E::get_entity_name();
     let view_model = view_model_or_500(actix_admin, &entity_name)?;
 
     if !user_can_perform(session, actix_admin, view_model, opts.action) {
         let mut ctx = Context::new();
         if opts.with_auth_context {
-            add_auth_context(session, actix_admin, &mut ctx);
+            add_auth_context(session, actix_admin, &mut ctx).await;
         }
         if opts.partial_unauth {
             ctx.insert("render_partial", &true);
@@ -131,7 +162,7 @@ pub fn begin_route<'a, E: ActixAdminViewModelTrait>(
     }
 
     if opts.verify_csrf {
-        crate::csrf::verify_csrf(actix_admin, session, req)?;
+        crate::csrf::verify_csrf(actix_admin, session, headers, query).await?;
     }
 
     let tenant_ref = actix_admin
@@ -151,15 +182,23 @@ pub fn begin_route<'a, E: ActixAdminViewModelTrait>(
 /// returning early on either the propagated error or the pre-built response.
 #[macro_export]
 macro_rules! admin_prelude {
-    ($session:expr, $req:expr, $actix_admin:expr, $opts:expr, $entity:ty) => {{
-        match $crate::routes::begin_route::<$entity>($session, $req, $actix_admin, $opts)? {
+    ($session:expr, $headers:expr, $query:expr, $actix_admin:expr, $opts:expr, $entity:ty) => {{
+        match $crate::routes::begin_route::<$entity>(
+            $session,
+            $headers,
+            $query,
+            $actix_admin,
+            $opts,
+        )
+        .await?
+        {
             Ok(ctx) => ctx,
             Err(resp) => return Ok(resp),
         }
     }};
 }
 
-pub fn add_auth_context(session: &Session, actix_admin: &ActixAdmin, ctx: &mut Context) {
+pub async fn add_auth_context(session: &Session, actix_admin: &ActixAdmin, ctx: &mut Context) {
     let cfg = &actix_admin.configuration;
     ctx.insert("enable_auth", &cfg.enable_auth);
     ctx.insert("custom_css_paths", &cfg.custom_css_paths);
@@ -172,7 +211,7 @@ pub fn add_auth_context(session: &Session, actix_admin: &ActixAdmin, ctx: &mut C
     // it unconditionally without checking `enable_csrf`.
     let mut token_value = String::new();
     if cfg.enable_csrf {
-        token_value = csrf_token_for(session).unwrap_or_default();
+        token_value = csrf_token_for(session).await.unwrap_or_default();
     }
     ctx.insert("csrf_token", &token_value);
     if cfg.enable_auth {
@@ -234,15 +273,18 @@ pub fn forbid_if_denied(
     actix_admin: &ActixAdmin,
     view_model: &ActixAdminViewModel,
     action: AdminAction,
-) -> Option<HttpResponse> {
+) -> Option<Response> {
     if user_can_perform(session, actix_admin, view_model, action) {
         None
     } else {
-        Some(HttpResponse::Forbidden().finish())
+        Some(StatusCode::FORBIDDEN.into_response())
     }
 }
 
-pub fn render_unauthorized(ctx: &Context, actix_admin: &ActixAdmin) -> Result<HttpResponse, Error> {
+pub fn render_unauthorized(
+    ctx: &Context,
+    actix_admin: &ActixAdmin,
+) -> Result<Response, ActixAdminError> {
     // Fall back to a short plain-text body if the template render fails
     // (e.g. the caller only supplied a partial context). Returning 500
     // here would leak an internal error to a user who simply lacks a
@@ -251,9 +293,7 @@ pub fn render_unauthorized(ctx: &Context, actix_admin: &ActixAdmin) -> Result<Ht
         .tera
         .render("unauthorized.html", ctx)
         .unwrap_or_else(|_| String::from("Forbidden"));
-    Ok(HttpResponse::Forbidden()
-        .content_type("text/html")
-        .body(body))
+    Ok(html_response(StatusCode::FORBIDDEN, body))
 }
 
 /// Render `template_name` with `ctx`, falling back to rendering only the
@@ -282,9 +322,9 @@ pub fn render_template(
 pub fn view_model_or_500<'a>(
     actix_admin: &'a ActixAdmin,
     entity_name: &str,
-) -> Result<&'a ActixAdminViewModel, Error> {
+) -> Result<&'a ActixAdminViewModel, ActixAdminError> {
     actix_admin.view_models.get(entity_name).ok_or_else(|| {
-        error::ErrorInternalServerError(format!(
+        ActixAdminError::internal(format!(
             "View model for entity '{entity_name}' is not registered"
         ))
     })
@@ -297,7 +337,8 @@ pub fn view_model_or_500<'a>(
 #[allow(clippy::too_many_arguments)]
 pub async fn render_create_or_edit_form<E: ActixAdminViewModelTrait>(
     session: &Session,
-    req: HttpRequest,
+    headers: &HeaderMap,
+    query: &str,
     actix_admin: &ActixAdmin,
     view_model: &ActixAdminViewModel,
     db: &sea_orm::DatabaseConnection,
@@ -306,25 +347,25 @@ pub async fn render_create_or_edit_form<E: ActixAdminViewModelTrait>(
     tenant_ref: Option<i32>,
     notifications: Vec<ActixAdminNotification>,
     is_inline: bool,
-    status: actix_web::http::StatusCode,
-) -> Result<HttpResponse, Error> {
+    status: StatusCode,
+) -> Result<Response, ActixAdminError> {
     let mut ctx = Context::new();
-    add_auth_context(session, actix_admin, &mut ctx);
+    add_auth_context(session, actix_admin, &mut ctx).await;
 
-    let params = Params::from_query(req.query_string());
+    let params = Params::from_query(query);
     let search_params = SearchParams::from_params(&params, view_model);
 
     ctx.insert(
         "select_lists",
         &E::get_select_lists(db, tenant_ref)
             .await
-            .map_err(actix_web::error::ErrorInternalServerError)?,
+            .map_err(|e| ActixAdminError::internal(e.to_string()))?,
     );
     ctx.insert("model", model);
 
     add_default_context_with_session(
         &mut ctx,
-        req,
+        headers,
         view_model,
         entity_name,
         actix_admin,
@@ -339,22 +380,23 @@ pub async fn render_create_or_edit_form<E: ActixAdminViewModelTrait>(
         "create_or_edit.html"
     };
     let body = render_template(&actix_admin.tera, template_path, &ctx)
-        .map_err(actix_web::error::ErrorInternalServerError)?;
-    Ok(actix_web::HttpResponse::build(status)
-        .content_type("text/html")
-        .body(body))
+        .map_err(|e| ActixAdminError::internal(e.to_string()))?;
+    Ok(html_response(status, body))
 }
 
 /// Validate that `sort_by` refers to a real, non-hidden field on the view model.
 /// Returns Ok(sort_by) or a 400 error.
-pub fn validate_sort_by(view_model: &ActixAdminViewModel, sort_by: &str) -> Result<(), Error> {
+pub fn validate_sort_by(
+    view_model: &ActixAdminViewModel,
+    sort_by: &str,
+) -> Result<(), ActixAdminError> {
     if sort_by == view_model.primary_key {
         return Ok(());
     }
     if view_model.fields.iter().any(|f| f.field_name == sort_by) {
         Ok(())
     } else {
-        Err(error::ErrorBadRequest(format!(
+        Err(ActixAdminError::bad_request(format!(
             "Unknown sort column: {sort_by}"
         )))
     }
@@ -415,7 +457,7 @@ impl SearchParams {
 #[allow(dead_code)]
 pub fn add_default_context(
     ctx: &mut Context,
-    req: HttpRequest,
+    headers: &HeaderMap,
     view_model: &ActixAdminViewModel,
     entity_name: String,
     actix_admin: &ActixAdmin,
@@ -424,7 +466,7 @@ pub fn add_default_context(
 ) {
     add_default_context_with_session(
         ctx,
-        req,
+        headers,
         view_model,
         entity_name,
         actix_admin,
@@ -439,7 +481,7 @@ pub fn add_default_context(
 #[allow(clippy::too_many_arguments)]
 pub fn add_default_context_with_session(
     ctx: &mut Context,
-    req: HttpRequest,
+    headers: &HeaderMap,
     view_model: &ActixAdminViewModel,
     entity_name: String,
     actix_admin: &ActixAdmin,
@@ -447,7 +489,7 @@ pub fn add_default_context_with_session(
     search_params: &SearchParams,
     session: Option<&Session>,
 ) {
-    let render_partial = req.headers().contains_key("HX-Target");
+    let render_partial = headers.contains_key("HX-Target");
 
     let mut serializable = ActixAdminViewModelSerializable::from(view_model.clone());
     if let Some(session) = session {

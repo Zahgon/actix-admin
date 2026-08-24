@@ -1,25 +1,33 @@
-use actix_session::Session;
-use actix_web::{error, web, Error, HttpRequest, HttpResponse};
+use axum::extract::OriginalUri;
+use axum::http::StatusCode;
+use axum::response::Response;
+use axum::Extension;
+use std::sync::Arc;
 use tera::Context;
+use tower_sessions::Session;
 
 use crate::prelude::*;
 
+use super::helpers::html_response;
 use super::add_auth_context;
 
 pub async fn display_card_grid(
     session: Session,
-    data: web::Data<ActixAdmin>,
-    req: HttpRequest,
-) -> Result<HttpResponse, Error> {
-    let actix_admin = &data.into_inner();
-    let path = req
+    Extension(actix_admin): Extension<Arc<ActixAdmin>>,
+    OriginalUri(uri): OriginalUri,
+) -> Result<Response, ActixAdminError> {
+    let actix_admin = &actix_admin;
+    // `OriginalUri` (not the extractor `Uri`) because `Router::nest` strips
+    // the `base_path` prefix from the request URI, and this lookup key is
+    // derived by removing that same prefix from the full path.
+    let path = uri
         .path()
         .replace(actix_admin.configuration.base_path, "")
         .replace("/", "");
     let card_grid = actix_admin
         .card_grids
         .get(path.as_str())
-        .ok_or_else(|| error::ErrorNotFound("Card grid not found"))?;
+        .ok_or_else(|| ActixAdminError::not_found("Card grid not found"))?;
 
     let entity_name = actix_admin
         .entity_names
@@ -38,11 +46,11 @@ pub async fn display_card_grid(
     );
     ctx.insert("card_grid", card_grid);
 
-    add_auth_context(&session, actix_admin, &mut ctx);
+    add_auth_context(&session, actix_admin, &mut ctx).await;
 
     let body = actix_admin
         .tera
         .render("card_grid.html", &ctx)
-        .map_err(|e| error::ErrorInternalServerError(format!("Template error: {e}")))?;
-    Ok(HttpResponse::Ok().content_type("text/html").body(body))
+        .map_err(|e| ActixAdminError::internal(format!("Template error: {e}")))?;
+    Ok(html_response(StatusCode::OK, body))
 }

@@ -3,13 +3,14 @@ use test_setup::prelude::*;
 
 #[cfg(test)]
 mod post_create_and_edit_is_success {
+    use super::form_request;
     use actix_admin::prelude::*;
-    use actix_web::{http::header::ContentType, test, App};
     use chrono::{NaiveDate, NaiveDateTime};
     use sea_orm::{prelude::Decimal, EntityTrait, PaginatorTrait};
     use serde::Serialize;
 
     use crate::create_app;
+    use tower::ServiceExt;
 
     #[derive(Serialize, Clone)]
     pub struct CommentModel {
@@ -31,7 +32,7 @@ mod post_create_and_edit_is_success {
         insert_date: &'static str,
     }
 
-    #[actix_web::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn comment_create_and_edit() {
         let db = super::setup_db(false).await;
         let app = create_app!(db, false, None, false);
@@ -47,12 +48,8 @@ mod post_create_and_edit_is_success {
             my_decimal: "113.141", // must be larger than 100
         };
 
-        let req = test::TestRequest::post()
-            .insert_header(ContentType::form_url_encoded())
-            .uri("/admin/comment/create_post_from_plaintext")
-            .set_form(model.clone())
-            .to_request();
-        let resp = test::call_service(&app, req).await;
+        let req = form_request("POST", "/admin/comment/create_post_from_plaintext", model.clone());
+        let resp = app.clone().oneshot(req).await.unwrap();
 
         assert!(resp.status().is_redirection());
 
@@ -82,12 +79,8 @@ mod post_create_and_edit_is_success {
         model.insert_date = "1987-04-01T14:00";
         model.is_visible = "false";
 
-        let edit_req = test::TestRequest::post()
-            .insert_header(ContentType::form_url_encoded())
-            .uri("/admin/comment/edit_post_from_plaintext/1")
-            .set_form(model.clone())
-            .to_request();
-        let resp = test::call_service(&app, edit_req).await;
+        let edit_req = form_request("POST", "/admin/comment/edit_post_from_plaintext/1", model.clone());
+        let resp = app.clone().oneshot(edit_req).await.unwrap();
 
         assert!(resp.status().is_redirection());
 
@@ -115,7 +108,7 @@ mod post_create_and_edit_is_success {
         );
     }
 
-    #[actix_web::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn post_create_and_edit() {
         let db = super::setup_db(false).await;
         let app = create_app!(db, false, None, false);
@@ -128,12 +121,8 @@ mod post_create_and_edit_is_success {
             tea_mandatory: "EverydayTea",
         };
 
-        let req = test::TestRequest::post()
-            .insert_header(ContentType::form_url_encoded())
-            .uri("/admin/post/create_post_from_plaintext")
-            .set_form(model.clone())
-            .to_request();
-        let resp = test::call_service(&app, req).await;
+        let req = form_request("POST", "/admin/post/create_post_from_plaintext", model.clone());
+        let resp = app.clone().oneshot(req).await.unwrap();
 
         assert!(resp.status().is_redirection());
 
@@ -163,12 +152,8 @@ mod post_create_and_edit_is_success {
         model.text = "updated";
         model.insert_date = "1987-04-01";
 
-        let edit_req = test::TestRequest::post()
-            .insert_header(ContentType::form_url_encoded())
-            .uri("/admin/post/edit_post_from_plaintext/1")
-            .set_form(model.clone())
-            .to_request();
-        let resp = test::call_service(&app, edit_req).await;
+        let edit_req = form_request("POST", "/admin/post/edit_post_from_plaintext/1", model.clone());
+        let resp = app.clone().oneshot(edit_req).await.unwrap();
 
         assert!(resp.status().is_redirection());
 

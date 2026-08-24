@@ -1,11 +1,15 @@
 use super::RoutePrelude;
 use crate::admin_prelude;
 use crate::prelude::*;
-use actix_session::Session;
-use actix_web::http::header;
-use actix_web::{web, Error, HttpRequest, HttpResponse};
+use axum::extract::{Path, RawQuery};
+use axum::http::{header, HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::{Extension, Form};
 use sea_orm::DatabaseConnection;
+use std::sync::Arc;
+use tower_sessions::Session;
 
+use super::helpers::run_local;
 use super::query::ListQuery;
 
 /// Delete file(s) attached to file-upload fields on the given model, best-effort.
@@ -42,22 +46,42 @@ fn delete_uploaded_files_for(
 
 pub async fn delete<E: ActixAdminViewModelTrait>(
     session: Session,
-    req: HttpRequest,
-    data: web::Data<ActixAdmin>,
-    db: web::Data<DatabaseConnection>,
-    id: web::Path<E::Id>,
-) -> Result<HttpResponse, Error> {
-    let actix_admin = &data.into_inner();
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+    Extension(actix_admin): Extension<Arc<ActixAdmin>>,
+    Extension(db): Extension<DatabaseConnection>,
+    Path(id): Path<E::Id>,
+) -> Result<Response, ActixAdminError> {
+    run_local(delete_inner::<E>(
+        session,
+        headers,
+        raw_query,
+        actix_admin,
+        db,
+        id,
+    ))
+}
+
+async fn delete_inner<E: ActixAdminViewModelTrait>(
+    session: Session,
+    headers: HeaderMap,
+    raw_query: Option<String>,
+    actix_admin: Arc<ActixAdmin>,
+    db: DatabaseConnection,
+    id: E::Id,
+) -> Result<Response, ActixAdminError> {
+    let actix_admin = &actix_admin;
+    let raw_query = raw_query.unwrap_or_default();
     let ctx = admin_prelude!(
         &session,
-        &req,
+        &headers,
+        &raw_query,
         actix_admin,
         RoutePrelude::write(super::AdminAction::Delete),
         E
     );
 
-    let db = db.get_ref();
-    let id = id.into_inner();
+    let db = &db;
 
     // Fetch first (to know upload paths) then delete.
     let model_result = E::get_entity(db, id.clone(), ctx.tenant_ref).await;
@@ -66,32 +90,53 @@ pub async fn delete<E: ActixAdminViewModelTrait>(
     match (model_result, delete_result) {
         (Ok(model), Ok(_)) => {
             delete_uploaded_files_for(actix_admin, &ctx.entity_name, ctx.view_model, &model);
-            Ok(HttpResponse::Ok().finish())
+            Ok(StatusCode::OK.into_response())
         }
         (_, Err(e)) if e.ty == crate::ActixAdminErrorType::EntityDoesNotExistError => {
-            Ok(HttpResponse::NotFound().finish())
+            Ok(StatusCode::NOT_FOUND.into_response())
         }
-        (_, _) => Ok(HttpResponse::InternalServerError().finish()),
+        (_, _) => Ok(StatusCode::INTERNAL_SERVER_ERROR.into_response()),
     }
 }
 
 pub async fn delete_many<E: ActixAdminViewModelTrait>(
     session: Session,
-    req: HttpRequest,
-    data: web::Data<ActixAdmin>,
-    db: web::Data<DatabaseConnection>,
-    form: web::Form<Vec<(String, String)>>,
-) -> Result<HttpResponse, Error> {
-    let actix_admin = data.get_ref();
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+    Extension(actix_admin): Extension<Arc<ActixAdmin>>,
+    Extension(db): Extension<DatabaseConnection>,
+    Form(form): Form<Vec<(String, String)>>,
+) -> Result<Response, ActixAdminError> {
+    run_local(delete_many_inner::<E>(
+        session,
+        headers,
+        raw_query,
+        actix_admin,
+        db,
+        form,
+    ))
+}
+
+async fn delete_many_inner<E: ActixAdminViewModelTrait>(
+    session: Session,
+    headers: HeaderMap,
+    raw_query: Option<String>,
+    actix_admin: Arc<ActixAdmin>,
+    db: DatabaseConnection,
+    form: Vec<(String, String)>,
+) -> Result<Response, ActixAdminError> {
+    let actix_admin = &actix_admin;
+    let raw_query = raw_query.unwrap_or_default();
     let ctx = admin_prelude!(
         &session,
-        &req,
+        &headers,
+        &raw_query,
         actix_admin,
         RoutePrelude::write(super::AdminAction::Delete),
         E
     );
 
-    let db = db.get_ref();
+    let db = &db;
     let mut errors: Vec<crate::ActixAdminError> = Vec::new();
 
     // Silently skip un-parseable ids rather than panicking on client input.
@@ -125,13 +170,15 @@ pub async fn delete_many<E: ActixAdminViewModelTrait>(
         // back into a URL query string, using the same encoder the list
         // route reads it with.
         let query = ListQuery::from_form(&form, ctx.view_model);
-        Ok(HttpResponse::SeeOther()
-            .append_header((
+        Ok((
+            StatusCode::SEE_OTHER,
+            [(
                 header::LOCATION,
                 format!("list?{}", query.to_query_string()),
-            ))
-            .finish())
+            )],
+        )
+            .into_response())
     } else {
-        Ok(HttpResponse::InternalServerError().finish())
+        Ok(StatusCode::INTERNAL_SERVER_ERROR.into_response())
     }
 }

@@ -4,22 +4,53 @@ use crate::admin_prelude;
 use crate::ActixAdminError;
 use crate::ActixAdminNotification;
 use crate::{prelude::*, ActixAdminErrorType};
-use actix_multipart::Multipart;
-use actix_session::Session;
-use actix_web::http::{header, StatusCode};
-use actix_web::{error, web, Error, HttpRequest, HttpResponse};
+use axum::extract::{FromRequest, Multipart, Path, RawQuery, Request};
+use axum::http::{header, HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::Extension;
 use sea_orm::DatabaseConnection;
 use std::collections::HashMap;
+use std::sync::Arc;
 use tera::Context;
+use tower_sessions::Session;
+
+use super::helpers::{html_response, run_local};
 
 pub async fn create_post<E: ActixAdminViewModelTrait>(
     session: Session,
-    req: HttpRequest,
-    data: web::Data<ActixAdmin>,
-    db: web::Data<DatabaseConnection>,
-    payload: Multipart,
-) -> Result<HttpResponse, Error> {
-    let actix_admin = data.get_ref();
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+    Extension(actix_admin): Extension<Arc<ActixAdmin>>,
+    Extension(db): Extension<DatabaseConnection>,
+    request: Request,
+) -> Result<Response, ActixAdminError> {
+    run_local(create_post_inner::<E>(
+        session,
+        headers,
+        raw_query,
+        actix_admin,
+        db,
+        request,
+    ))
+}
+
+async fn create_post_inner<E: ActixAdminViewModelTrait>(
+    session: Session,
+    headers: HeaderMap,
+    raw_query: Option<String>,
+    actix_admin: Arc<ActixAdmin>,
+    db: DatabaseConnection,
+    request: Request,
+) -> Result<Response, ActixAdminError> {
+    let actix_admin = &actix_admin;
+    let raw_query = raw_query.unwrap_or_default();
+    // CSRF must be verified before the body is consumed: a Multipart extractor
+    // argument would 400 a non-multipart body before the CSRF check, whereas
+    // actix-web ran CSRF first and returned 403.
+    verify_csrf(actix_admin, &session, &headers, &raw_query).await?;
+    let payload = Multipart::from_request(request, &())
+        .await
+        .map_err(|e| ActixAdminError::bad_request(e.to_string()))?;
     let model = ActixAdminModel::create_from_payload(
         None,
         payload,
@@ -30,19 +61,53 @@ pub async fn create_post<E: ActixAdminViewModelTrait>(
         ),
     )
     .await;
-    create_or_edit_post::<E>(&session, req, db, model, None::<E::Id>, actix_admin).await
+    create_or_edit_post::<E>(
+        &session,
+        &headers,
+        &raw_query,
+        &db,
+        model,
+        None::<E::Id>,
+        actix_admin,
+    )
+    .await
 }
 
 pub async fn edit_post<E: ActixAdminViewModelTrait>(
     session: Session,
-    req: HttpRequest,
-    data: web::Data<ActixAdmin>,
-    db: web::Data<DatabaseConnection>,
-    payload: Multipart,
-    id: web::Path<E::Id>,
-) -> Result<HttpResponse, Error> {
-    let actix_admin = data.get_ref();
-    let id = id.into_inner();
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+    Extension(actix_admin): Extension<Arc<ActixAdmin>>,
+    Extension(db): Extension<DatabaseConnection>,
+    Path(id): Path<E::Id>,
+    request: Request,
+) -> Result<Response, ActixAdminError> {
+    run_local(edit_post_inner::<E>(
+        session,
+        headers,
+        raw_query,
+        actix_admin,
+        db,
+        id,
+        request,
+    ))
+}
+
+async fn edit_post_inner<E: ActixAdminViewModelTrait>(
+    session: Session,
+    headers: HeaderMap,
+    raw_query: Option<String>,
+    actix_admin: Arc<ActixAdmin>,
+    db: DatabaseConnection,
+    id: E::Id,
+    request: Request,
+) -> Result<Response, ActixAdminError> {
+    let actix_admin = &actix_admin;
+    let raw_query = raw_query.unwrap_or_default();
+    verify_csrf(actix_admin, &session, &headers, &raw_query).await?;
+    let payload = Multipart::from_request(request, &())
+        .await
+        .map_err(|e| ActixAdminError::bad_request(e.to_string()))?;
     let model = ActixAdminModel::create_from_payload(
         Some(id.to_string()),
         payload,
@@ -53,17 +118,27 @@ pub async fn edit_post<E: ActixAdminViewModelTrait>(
         ),
     )
     .await;
-    create_or_edit_post::<E>(&session, req, db, model, Some(id), actix_admin).await
+    create_or_edit_post::<E>(
+        &session,
+        &headers,
+        &raw_query,
+        &db,
+        model,
+        Some(id),
+        actix_admin,
+    )
+    .await
 }
 
 pub async fn create_or_edit_post<E: ActixAdminViewModelTrait>(
     session: &Session,
-    req: HttpRequest,
-    db: web::Data<DatabaseConnection>,
+    headers: &HeaderMap,
+    query: &str,
+    db: &DatabaseConnection,
     model_res: Result<ActixAdminModel, ActixAdminError>,
     id: Option<E::Id>,
     actix_admin: &ActixAdmin,
-) -> Result<HttpResponse, Error> {
+) -> Result<Response, ActixAdminError> {
     let action = if id.is_some() {
         AdminAction::Edit
     } else {
@@ -74,7 +149,8 @@ pub async fn create_or_edit_post<E: ActixAdminViewModelTrait>(
     // create/edit is asserted via the `_csrf` query param (see csrf.rs docs).
     let ctx = admin_prelude!(
         session,
-        &req,
+        headers,
+        query,
         actix_admin,
         RoutePrelude {
             action,
@@ -84,19 +160,12 @@ pub async fn create_or_edit_post<E: ActixAdminViewModelTrait>(
         },
         E
     );
-    let db = db.get_ref();
 
     let mut model = match model_res {
         Ok(m) => m,
         Err(e) => {
             // Fail closed on multipart/upload errors instead of panicking.
-            return Err(actix_web::error::InternalError::from_response(
-                e.to_string(),
-                HttpResponse::build(actix_web::http::StatusCode::BAD_REQUEST)
-                    .content_type("text/plain")
-                    .body(e.to_string()),
-            )
-            .into());
+            return Err(ActixAdminError::bad_request(e.to_string()));
         }
     };
     let _ = E::validate_entity(&mut model, db).await;
@@ -108,7 +177,8 @@ pub async fn create_or_edit_post<E: ActixAdminViewModelTrait>(
         })];
         return render_create_or_edit_form::<E>(
             session,
-            req,
+            headers,
+            query,
             actix_admin,
             ctx.view_model,
             db,
@@ -129,16 +199,16 @@ pub async fn create_or_edit_post<E: ActixAdminViewModelTrait>(
 
     match res {
         Ok(model) => {
-            let params = Params::from_query(req.query_string());
+            let params = Params::from_query(query);
             let search_params = SearchParams::from_params(&params, ctx.view_model);
 
             if ctx.view_model.inline_edit {
                 let mut tctx = Context::new();
                 tctx.insert("entity", &model);
-                super::helpers::add_auth_context(session, actix_admin, &mut tctx);
+                super::helpers::add_auth_context(session, actix_admin, &mut tctx).await;
                 add_default_context_with_session(
                     &mut tctx,
-                    req,
+                    headers,
                     ctx.view_model,
                     ctx.entity_name,
                     actix_admin,
@@ -149,11 +219,12 @@ pub async fn create_or_edit_post<E: ActixAdminViewModelTrait>(
                 let body = actix_admin
                     .tera
                     .render("list/row.html", &tctx)
-                    .map_err(error::ErrorInternalServerError)?;
-                Ok(HttpResponse::Ok().content_type("text/html").body(body))
+                    .map_err(|e| ActixAdminError::internal(e.to_string()))?;
+                Ok(html_response(StatusCode::OK, body))
             } else {
-                Ok(HttpResponse::SeeOther()
-                    .append_header((
+                Ok((
+                    StatusCode::SEE_OTHER,
+                    [(
                         header::LOCATION,
                         format!(
                             "{0}/{1}/list?{2}",
@@ -161,14 +232,16 @@ pub async fn create_or_edit_post<E: ActixAdminViewModelTrait>(
                             ctx.entity_name,
                             search_params.to_query_string()
                         ),
-                    ))
-                    .finish())
+                    )],
+                )
+                    .into_response())
             }
         }
         Err(e) => {
             render_create_or_edit_form::<E>(
                 session,
-                req,
+                headers,
+                query,
                 actix_admin,
                 ctx.view_model,
                 db,

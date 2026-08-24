@@ -14,7 +14,10 @@ pub use sample_with_tenant_id::Entity as SampleWithTenantId;
 #[allow(unused_imports)]
 pub mod prelude {
     pub use super::*;
-    pub use crate::test_setup::helper::{create_actix_admin_builder, setup_db, BodyTest};
+    pub use crate::test_setup::helper::{
+        create_actix_admin_builder, create_csrf_admin_router, form_request, form_request_raw,
+        read_body, request, setup_db, wrap_admin_router, BodyTest,
+    };
     pub use crate::test_setup::webdriver::{setup, teardown, wait_for_url_contains};
 }
 

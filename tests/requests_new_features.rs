@@ -15,13 +15,9 @@ mod test_setup;
 
 use actix_admin::prelude::*;
 use actix_admin::routes::ActixAdminBulkActionDispatch;
-use actix_session::config::CookieContentSecurity;
-use actix_session::storage::CookieSessionStore;
-use actix_session::SessionMiddleware;
-use actix_web::body::to_bytes;
-use actix_web::cookie::Key;
-use actix_web::{test, web, App};
+use axum::response::Response;
 use sea_orm::DatabaseConnection;
+use tower::ServiceExt;
 
 use test_setup::prelude::*;
 use test_setup::{Comment, Post};
@@ -86,34 +82,18 @@ fn build_admin(enable_csrf: bool, restrict_perms: bool) -> ActixAdminBuilder {
     builder
 }
 
-/// Init a service with a session middleware (required for CSRF/flash).
-/// Returns the initialised `Service` and the underlying db.
+/// Init a router with a session layer (required for CSRF/flash).
 macro_rules! init_app {
     ($db:expr, $enable_csrf:expr, $restrict_perms:expr) => {{
         let conn = $db.clone();
         let builder = build_admin($enable_csrf, $restrict_perms);
         let actix_admin = builder.get_actix_admin();
-        // Deterministic 64-byte key so cookies survive across requests
-        // in the same test run.
-        let key = Key::from(&[0u8; 64]);
-        test::init_service(
-            App::new()
-                .wrap(
-                    SessionMiddleware::builder(CookieSessionStore::default(), key)
-                        .cookie_secure(false)
-                        .cookie_content_security(CookieContentSecurity::Private)
-                        .build(),
-                )
-                .app_data(web::Data::new(actix_admin))
-                .app_data(web::Data::new(conn))
-                .service(builder.get_scope()),
-        )
-        .await
+        wrap_admin_router(builder.get_scope(), actix_admin, conn)
     }};
 }
 
-async fn body_utf8(resp: actix_web::dev::ServiceResponse) -> String {
-    let body = to_bytes(resp.into_body()).await.unwrap();
+async fn body_utf8(resp: Response) -> String {
+    let body = read_body(resp).await;
     String::from_utf8_lossy(&body).into_owned()
 }
 
@@ -121,15 +101,13 @@ async fn body_utf8(resp: actix_web::dev::ServiceResponse) -> String {
 // 1. Field-type renderers on the list page
 // ------------------------------------------------------------------
 
-#[actix_web::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn list_renders_new_field_types() {
     let db: DatabaseConnection = setup_db(true).await;
     let app = init_app!(&db, false, false);
 
-    let req = test::TestRequest::get()
-        .uri("/admin/post/list")
-        .to_request();
-    let resp = test::call_service(&app, req).await;
+    let req = request("GET", "/admin/post/list");
+    let resp = app.clone().oneshot(req).await.unwrap();
     assert!(resp.status().is_success(), "status: {}", resp.status());
     let body = body_utf8(resp).await;
 
@@ -159,15 +137,13 @@ async fn list_renders_new_field_types() {
 // 2. Show page renders new field types (readonly / rich-text / image large preview)
 // ------------------------------------------------------------------
 
-#[actix_web::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn show_renders_new_field_types_and_readonly() {
     let db = setup_db(true).await;
     let app = init_app!(&db, false, false);
 
-    let req = test::TestRequest::get()
-        .uri("/admin/post/show/3")
-        .to_request();
-    let resp = test::call_service(&app, req).await;
+    let req = request("GET", "/admin/post/show/3");
+    let resp = app.clone().oneshot(req).await.unwrap();
     assert!(resp.status().is_success());
     let body = body_utf8(resp).await;
 
@@ -185,10 +161,8 @@ async fn show_renders_new_field_types_and_readonly() {
 
     // Edit page: the readonly attribute must be present on the input
     // and EasyMDE textarea id must appear for the notes_md wysiwyg column.
-    let req = test::TestRequest::get()
-        .uri("/admin/post/edit/1")
-        .to_request();
-    let resp = test::call_service(&app, req).await;
+    let req = request("GET", "/admin/post/edit/1");
+    let resp = app.clone().oneshot(req).await.unwrap();
     assert!(resp.status().is_success());
     let body = body_utf8(resp).await;
     assert!(
@@ -205,16 +179,14 @@ async fn show_renders_new_field_types_and_readonly() {
 // 3. Per-view permissions: buttons disappear + direct hits get 403
 // ------------------------------------------------------------------
 
-#[actix_web::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn permissions_hide_buttons_and_reject_direct_hits() {
     let db = setup_db(true).await;
     let app = init_app!(&db, false, /* restrict_perms */ true);
 
     // Buttons in the list HTML must be gone.
-    let req = test::TestRequest::get()
-        .uri("/admin/post/list")
-        .to_request();
-    let resp = test::call_service(&app, req).await;
+    let req = request("GET", "/admin/post/list");
+    let resp = app.clone().oneshot(req).await.unwrap();
     assert!(resp.status().is_success());
     let body = body_utf8(resp).await;
     assert!(
@@ -227,30 +199,24 @@ async fn permissions_hide_buttons_and_reject_direct_hits() {
     );
 
     // Direct hits are 403.
-    let req = test::TestRequest::get()
-        .uri("/admin/post/create")
-        .to_request();
-    let resp = test::call_service(&app, req).await;
+    let req = request("GET", "/admin/post/create");
+    let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(
         resp.status(),
         403,
         "GET /create should be 403 when can_create=false"
     );
 
-    let req = test::TestRequest::get()
-        .uri("/admin/post/export_csv")
-        .to_request();
-    let resp = test::call_service(&app, req).await;
+    let req = request("GET", "/admin/post/export_csv");
+    let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(
         resp.status(),
         403,
         "GET /export_csv should be 403 when can_export=false"
     );
 
-    let req = test::TestRequest::delete()
-        .uri("/admin/post/delete/1")
-        .to_request();
-    let resp = test::call_service(&app, req).await;
+    let req = request("DELETE", "/admin/post/delete/1");
+    let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(
         resp.status(),
         403,
@@ -262,16 +228,14 @@ async fn permissions_hide_buttons_and_reject_direct_hits() {
 // 4. Custom bulk actions
 // ------------------------------------------------------------------
 
-#[actix_web::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn bulk_action_dropdown_and_dispatch() {
     let db = setup_db(true).await;
     let app = init_app!(&db, false, false);
 
     // The list page must expose the action entry (label + POST url).
-    let req = test::TestRequest::get()
-        .uri("/admin/post/list")
-        .to_request();
-    let resp = test::call_service(&app, req).await;
+    let req = request("GET", "/admin/post/list");
+    let resp = app.clone().oneshot(req).await.unwrap();
     let body = body_utf8(resp).await;
     assert!(
         body.contains("Mark selected as reviewed"),
@@ -283,11 +247,8 @@ async fn bulk_action_dropdown_and_dispatch() {
     );
 
     // Dispatching a known action returns 303 (see-other back to /list).
-    let req = test::TestRequest::post()
-        .uri("/admin/post/action/mark_reviewed")
-        .set_form([("ids", "1"), ("ids", "2"), ("ids", "3")])
-        .to_request();
-    let resp = test::call_service(&app, req).await;
+    let req = form_request("POST", "/admin/post/action/mark_reviewed", [("ids", "1"), ("ids", "2"), ("ids", "3")]);
+    let resp = app.clone().oneshot(req).await.unwrap();
     assert!(
         resp.status().is_redirection(),
         "known bulk action must redirect to /list, got {}",
@@ -296,11 +257,8 @@ async fn bulk_action_dropdown_and_dispatch() {
 
     // Dispatching an unknown action returns 404 (the {entity}/action/{name}
     // route only knows about names that were registered on the builder).
-    let req = test::TestRequest::post()
-        .uri("/admin/post/action/does_not_exist")
-        .set_form([("ids", "1")])
-        .to_request();
-    let resp = test::call_service(&app, req).await;
+    let req = form_request("POST", "/admin/post/action/does_not_exist", [("ids", "1")]);
+    let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(
         resp.status(),
         404,
@@ -314,7 +272,7 @@ async fn bulk_action_dropdown_and_dispatch() {
 //    the `filter_<name>__op=` param is accepted by the list route.
 // ------------------------------------------------------------------
 
-#[actix_web::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn filter_operator_picker_is_rendered_and_accepted() {
     let db = setup_db(true).await;
     let app = init_app!(&db, false, false);
@@ -322,10 +280,8 @@ async fn filter_operator_picker_is_rendered_and_accepted() {
     // (a) The list page renders the operator picker for the "User"
     //     filter declared on Comment (which advertises Contains / Equals /
     //     NotEquals / IsNull).
-    let req = test::TestRequest::get()
-        .uri("/admin/comment/list")
-        .to_request();
-    let resp = test::call_service(&app, req).await;
+    let req = request("GET", "/admin/comment/list");
+    let resp = app.clone().oneshot(req).await.unwrap();
     assert!(resp.status().is_success());
     let body = body_utf8(resp).await;
     assert!(
@@ -344,10 +300,8 @@ async fn filter_operator_picker_is_rendered_and_accepted() {
     // (b) The list route accepts and does not choke on an operator query
     //     string. We just assert 200: the semantics of the filter itself
     //     are exercised by the doc / macro.
-    let req = test::TestRequest::get()
-        .uri("/admin/comment/list?filter_User=me@home.com&filter_User__op=contains")
-        .to_request();
-    let resp = test::call_service(&app, req).await;
+    let req = request("GET", "/admin/comment/list?filter_User=me@home.com&filter_User__op=contains");
+    let resp = app.clone().oneshot(req).await.unwrap();
     assert!(
         resp.status().is_success(),
         "list route rejected operator query string: {}",
@@ -355,10 +309,8 @@ async fn filter_operator_picker_is_rendered_and_accepted() {
     );
 
     // (c) An unknown operator name must not 500 the route.
-    let req = test::TestRequest::get()
-        .uri("/admin/comment/list?filter_User=x&filter_User__op=bogus")
-        .to_request();
-    let resp = test::call_service(&app, req).await;
+    let req = request("GET", "/admin/comment/list?filter_User=x&filter_User__op=bogus");
+    let resp = app.clone().oneshot(req).await.unwrap();
     assert!(
         resp.status().is_success(),
         "unknown operator crashed the list route: {}",
@@ -370,24 +322,20 @@ async fn filter_operator_picker_is_rendered_and_accepted() {
 // 6. CSRF protection
 // ------------------------------------------------------------------
 
-#[actix_web::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn csrf_rejects_state_changes_without_token() {
     let db = setup_db(true).await;
     let app = init_app!(&db, /* enable_csrf */ true, false);
 
     // GET list is safe and must render + set a session cookie carrying
     // the freshly minted CSRF token.
-    let req = test::TestRequest::get()
-        .uri("/admin/post/list")
-        .to_request();
-    let resp = test::call_service(&app, req).await;
+    let req = request("GET", "/admin/post/list");
+    let resp = app.clone().oneshot(req).await.unwrap();
     assert!(resp.status().is_success());
 
     // DELETE without token → 403.
-    let req = test::TestRequest::delete()
-        .uri("/admin/post/delete/1")
-        .to_request();
-    let resp = test::call_service(&app, req).await;
+    let req = request("DELETE", "/admin/post/delete/1");
+    let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(
         resp.status(),
         403,
@@ -396,11 +344,8 @@ async fn csrf_rejects_state_changes_without_token() {
     );
 
     // POST bulk action without token → 403.
-    let req = test::TestRequest::post()
-        .uri("/admin/post/action/mark_reviewed")
-        .set_form([("ids", "1")])
-        .to_request();
-    let resp = test::call_service(&app, req).await;
+    let req = form_request("POST", "/admin/post/action/mark_reviewed", [("ids", "1")]);
+    let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(
         resp.status(),
         403,
@@ -413,10 +358,8 @@ async fn csrf_rejects_state_changes_without_token() {
     // is always on.
     let db2 = setup_db(true).await;
     let app2 = init_app!(&db2, /* enable_csrf */ false, false);
-    let req = test::TestRequest::delete()
-        .uri("/admin/post/delete/1")
-        .to_request();
-    let resp = test::call_service(&app2, req).await;
+    let req = request("DELETE", "/admin/post/delete/1");
+    let resp = app2.clone().oneshot(req).await.unwrap();
     assert!(
         !matches!(resp.status().as_u16(), 401 | 403),
         "delete with CSRF disabled unexpectedly rejected: {}",
@@ -428,15 +371,13 @@ async fn csrf_rejects_state_changes_without_token() {
 // 7. When CSRF is enabled, the token is exposed to templates.
 // ------------------------------------------------------------------
 
-#[actix_web::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn csrf_token_is_exposed_in_rendered_page() {
     let db = setup_db(true).await;
     let app = init_app!(&db, true, false);
 
-    let req = test::TestRequest::get()
-        .uri("/admin/post/list")
-        .to_request();
-    let resp = test::call_service(&app, req).await;
+    let req = request("GET", "/admin/post/list");
+    let resp = app.clone().oneshot(req).await.unwrap();
     let body = body_utf8(resp).await;
     assert!(
         body.contains("csrf-token"),

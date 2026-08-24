@@ -16,13 +16,18 @@
 //!
 //! [`add_bulk_action_for_entity`]: crate::builder::ActixAdminBuilderTrait::add_bulk_action_for_entity
 
-use actix_session::Session;
-use actix_web::{http::header, web, Error, HttpRequest, HttpResponse};
+use axum::extract::{Path, RawQuery};
+use axum::http::{header, HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::{Extension, Form};
 use sea_orm::DatabaseConnection;
+use std::sync::Arc;
+use tower_sessions::Session;
 
 use crate::admin_prelude;
 use crate::prelude::*;
 
+use super::helpers::run_local;
 use super::RoutePrelude;
 
 /// Dispatch trait implemented per entity to route named bulk actions to
@@ -61,23 +66,51 @@ pub trait ActixAdminBulkActionDispatch: ActixAdminViewModelTrait {
 /// HTTP handler for `POST /{entity}/action/{name}`.
 pub async fn bulk_action<E: ActixAdminBulkActionDispatch + 'static>(
     session: Session,
-    req: HttpRequest,
-    data: web::Data<ActixAdmin>,
-    db: web::Data<DatabaseConnection>,
-    form: web::Form<Vec<(String, String)>>,
-    path: web::Path<String>,
-) -> Result<HttpResponse, Error> {
-    let actix_admin = data.get_ref();
-    let ctx = admin_prelude!(&session, &req, actix_admin, RoutePrelude::bulk(), E);
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+    Extension(actix_admin): Extension<Arc<ActixAdmin>>,
+    Extension(db): Extension<DatabaseConnection>,
+    Path(action_name): Path<String>,
+    Form(form): Form<Vec<(String, String)>>,
+) -> Result<Response, ActixAdminError> {
+    run_local(bulk_action_inner::<E>(
+        session,
+        headers,
+        raw_query,
+        actix_admin,
+        db,
+        action_name,
+        form,
+    ))
+}
 
-    let action_name = path.into_inner();
+async fn bulk_action_inner<E: ActixAdminBulkActionDispatch + 'static>(
+    session: Session,
+    headers: HeaderMap,
+    raw_query: Option<String>,
+    actix_admin: Arc<ActixAdmin>,
+    db: DatabaseConnection,
+    action_name: String,
+    form: Vec<(String, String)>,
+) -> Result<Response, ActixAdminError> {
+    let actix_admin = &actix_admin;
+    let raw_query = raw_query.unwrap_or_default();
+    let ctx = admin_prelude!(
+        &session,
+        &headers,
+        &raw_query,
+        actix_admin,
+        RoutePrelude::bulk(),
+        E
+    );
+
     if !ctx
         .view_model
         .bulk_actions
         .iter()
         .any(|a| a.name == action_name)
     {
-        return Ok(HttpResponse::NotFound().body("unknown bulk action"));
+        return Ok((StatusCode::NOT_FOUND, "unknown bulk action").into_response());
     }
 
     let ids: Vec<E::Id> = form
@@ -85,7 +118,7 @@ pub async fn bulk_action<E: ActixAdminBulkActionDispatch + 'static>(
         .filter_map(|(k, v)| (k == "ids").then(|| v.parse::<E::Id>().ok()).flatten())
         .collect();
 
-    let db = db.get_ref();
+    let db = &db;
     let result = E::run_bulk_action(&action_name, db, ids, ctx.tenant_ref).await;
 
     match result {
@@ -94,17 +127,19 @@ pub async fn bulk_action<E: ActixAdminBulkActionDispatch + 'static>(
             // yet have a flash-message channel; the message returned by the
             // handler is logged for observability.
             log::info!(target: "actix_admin::bulk_action", "{}/{action_name}: {_msg}", ctx.entity_name);
-            Ok(HttpResponse::SeeOther()
-                .append_header((
+            Ok((
+                StatusCode::SEE_OTHER,
+                [(
                     header::LOCATION,
                     format!(
                         "{}/{}/list",
                         actix_admin.configuration.base_path, ctx.entity_name
                     ),
-                ))
-                .finish())
+                )],
+            )
+                .into_response())
         }
-        Ok(None) => Ok(HttpResponse::NotFound().body("unknown bulk action")),
-        Err(e) => Err(e.into()),
+        Ok(None) => Ok((StatusCode::NOT_FOUND, "unknown bulk action").into_response()),
+        Err(e) => Err(e),
     }
 }

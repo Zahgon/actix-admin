@@ -1,10 +1,14 @@
 #[macro_use]
 extern crate serde_derive;
 
-use actix_session::Session;
-use actix_web::http::header;
-use actix_web::{web, HttpResponse};
+use axum::extract::Query;
+use axum::http::{header, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::routing::get;
+use axum::{Extension, Router};
 use oauth2::basic::{BasicClient, BasicTokenType};
+use std::sync::Arc;
+use tower_sessions::Session;
 use oauth2::{
     AccessToken, AuthorizationCode, CsrfToken, EmptyExtraTokenFields, EndpointNotSet, EndpointSet,
     Scope, StandardTokenResponse, TokenResponse,
@@ -74,15 +78,18 @@ impl AzureAuth {
             .expect("failed to build reqwest client")
     }
 
-    pub fn create_scope<T: AppDataTrait + 'static>(self) -> actix_web::Scope {
-        web::scope("/azure-auth")
-            .route("/login", web::get().to(login::<T>))
-            .route("/logout", web::get().to(logout))
-            .route("/auth", web::get().to(auth::<T>))
+    pub fn create_scope<T: AppDataTrait + Send + Sync + 'static>(self) -> Router {
+        Router::new().nest(
+            "/azure-auth",
+            Router::new()
+                .route("/login", get(login::<T>))
+                .route("/logout", get(logout))
+                .route("/auth", get(auth::<T>)),
+        )
     }
 }
 
-pub async fn login<T: AppDataTrait>(data: web::Data<T>) -> HttpResponse {
+pub async fn login<T: AppDataTrait>(Extension(data): Extension<Arc<T>>) -> Response {
     // Generate the authorization URL to which we'll redirect the user.
     let (auth_url, _csrf_token) = data
         .get_oauth()
@@ -93,16 +100,20 @@ pub async fn login<T: AppDataTrait>(data: web::Data<T>) -> HttpResponse {
         .add_scope(Scope::new("offline_access".to_string()))
         .url();
 
-    HttpResponse::Found()
-        .append_header((header::LOCATION, auth_url.to_string()))
-        .finish()
+    (
+        StatusCode::FOUND,
+        [(header::LOCATION, auth_url.to_string())],
+    )
+        .into_response()
 }
 
-pub async fn logout(session: Session) -> HttpResponse {
-    session.remove("user_info");
-    HttpResponse::Found()
-        .append_header((header::LOCATION, "/admin/".to_string()))
-        .finish()
+pub async fn logout(session: Session) -> Response {
+    let _: Option<UserInfo> = session.remove("user_info").await.unwrap_or(None);
+    (
+        StatusCode::FOUND,
+        [(header::LOCATION, "/admin/".to_string())],
+    )
+        .into_response()
 }
 
 async fn read_user(api_base_url: &str, access_token: &AccessToken) -> UserInfo {
@@ -133,9 +144,9 @@ type AzureTokenResponse = StandardTokenResponse<EmptyExtraTokenFields, BasicToke
 
 pub async fn auth<T: AppDataTrait>(
     session: Session,
-    data: web::Data<T>,
-    params: web::Query<AuthRequest>,
-) -> HttpResponse {
+    Extension(data): Extension<Arc<T>>,
+    Query(params): Query<AuthRequest>,
+) -> Response {
     let code = AuthorizationCode::new(params.code.clone());
     let _state = CsrfToken::new(params.state.clone());
     let api_base_url = AzureAuth::get_api_base_url();
@@ -150,9 +161,7 @@ pub async fn auth<T: AppDataTrait>(
 
     let user_info = read_user(api_base_url, token.access_token()).await;
 
-    session.insert("user_info", &user_info).unwrap();
+    session.insert("user_info", &user_info).await.unwrap();
 
-    HttpResponse::Found()
-        .append_header(("location", "/admin/"))
-        .finish()
+    (StatusCode::FOUND, [("location", "/admin/")]).into_response()
 }

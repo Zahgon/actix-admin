@@ -1,22 +1,29 @@
 extern crate serde_derive;
 
 use actix_admin::prelude::*;
-use actix_web::{http::Error, middleware, web, App, HttpResponse, HttpServer};
+use axum::http::{header, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
+use axum::{Extension, Form};
 use ollama_rs::generation::completion::request::GenerationRequest;
 use ollama_rs::Ollama;
 use sea_orm::ConnectOptions;
+use std::sync::Arc;
 use std::time::Duration;
 use tera::{Context, Tera};
 
+fn html(body: String) -> Response {
+    (StatusCode::OK, [(header::CONTENT_TYPE, "text/html")], body).into_response()
+}
+
 async fn support(
     session: Session,
-    tera: web::Data<Tera>,
-    actix_admin: web::Data<ActixAdmin>,
-) -> Result<HttpResponse, Error> {
+    Extension(tera): Extension<Arc<Tera>>,
+    Extension(actix_admin): Extension<Arc<ActixAdmin>>,
+) -> Response {
     let mut ctx = Context::new();
-    ctx.extend(get_admin_ctx(session, &actix_admin));
-    let body = tera.into_inner().render("support.html", &ctx).unwrap();
-    Ok(HttpResponse::Ok().content_type("text/html").body(body))
+    ctx.extend(get_admin_ctx(&session, &actix_admin).await);
+    html(tera.render("support.html", &ctx).unwrap())
 }
 
 #[derive(serde::Deserialize)]
@@ -27,10 +34,10 @@ struct SupportForm {
 
 async fn support_post(
     session: Session,
-    tera: web::Data<Tera>,
-    actix_admin: web::Data<ActixAdmin>,
-    form: web::Form<SupportForm>, // Add this parameter to extract form data
-) -> Result<HttpResponse, Error> {
+    Extension(tera): Extension<Arc<Tera>>,
+    Extension(actix_admin): Extension<Arc<ActixAdmin>>,
+    Form(form): Form<SupportForm>, // Add this parameter to extract form data
+) -> Response {
     let ollama = Ollama::default();
     let model = "llama3.1".to_string();
     // naive context, better use GenerationContext
@@ -41,23 +48,25 @@ async fn support_post(
 
     if let Ok(res) = res {
         let mut ctx = Context::new();
-        ctx.extend(get_admin_ctx(session, &actix_admin));
+        ctx.extend(get_admin_ctx(&session, &actix_admin).await);
         ctx.insert("answer", res.response.as_str());
-        let body = tera.into_inner().render("chat_answer.html", &ctx).unwrap();
-        Ok(HttpResponse::Ok().content_type("text/html").body(body))
+        html(tera.render("chat_answer.html", &ctx).unwrap())
     } else {
-        Ok(HttpResponse::InternalServerError().body("Failed generating answer"))
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed generating answer",
+        )
+            .into_response()
     }
 }
 
 async fn custom_index(
     session: Session,
-    tera: web::Data<Tera>,
-    actix_admin: web::Data<ActixAdmin>,
-) -> Result<HttpResponse, Error> {
-    let ctx = get_admin_ctx(session, &actix_admin);
-    let body = tera.render("custom_index.html", &ctx).unwrap();
-    Ok(HttpResponse::Ok().content_type("text/html").body(body))
+    Extension(tera): Extension<Arc<Tera>>,
+    Extension(actix_admin): Extension<Arc<ActixAdmin>>,
+) -> Response {
+    let ctx = get_admin_ctx(&session, &actix_admin).await;
+    html(tera.render("custom_index.html", &ctx).unwrap())
 }
 
 fn create_actix_admin_builder() -> ActixAdminBuilder {
@@ -77,10 +86,9 @@ fn create_actix_admin_builder() -> ActixAdminBuilder {
 
     let mut admin_builder = ActixAdminBuilder::new(configuration);
 
-    let _support_route = admin_builder.add_support_handler("/support", web::get().to(support));
-    let _support_route_post =
-        admin_builder.add_support_handler("/support", web::post().to(support_post));
-    let _custom_index = admin_builder.add_custom_handler_for_index(web::get().to(custom_index));
+    let _support_route = admin_builder.add_support_handler("/support", get(support));
+    let _support_route_post = admin_builder.add_support_handler("/support", post(support_post));
+    let _custom_index = admin_builder.add_custom_handler_for_index(get(custom_index));
 
     admin_builder
 }
@@ -96,35 +104,37 @@ fn get_db_options() -> ConnectOptions {
     opt
 }
 
-#[actix_rt::main]
+#[tokio::main]
 async fn main() {
     let opt = get_db_options();
     let conn: sea_orm::DatabaseConnection = sea_orm::Database::connect(opt).await.unwrap();
 
     println!("The admin interface is available at http://localhost:5000/absproxy/5000/admin");
 
-    HttpServer::new(move || {
-        let actix_admin_builder = create_actix_admin_builder();
+    let actix_admin_builder = create_actix_admin_builder();
+    let actix_admin = actix_admin_builder.get_actix_admin();
 
-        // Start from actix-admin's tera (filters + templates) and layer
-        // the example's own templates on top.
-        let mut tera = actix_admin_builder.get_actix_admin().tera.clone();
-        tera.load_from_glob(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/examples/chat_support/templates/*.html"
-        ))
-        .unwrap();
-
-        App::new()
-            .app_data(web::Data::new(tera))
-            .app_data(web::Data::new(actix_admin_builder.get_actix_admin()))
-            .app_data(web::Data::new(conn.clone()))
-            .service(actix_admin_builder.get_scope())
-            .wrap(middleware::Logger::default())
-    })
-    .bind("127.0.0.1:5000")
-    .expect("Can not bind to port 5000")
-    .run()
-    .await
+    // Start from actix-admin's tera (filters + templates) and layer
+    // the example's own templates on top.
+    let mut tera = actix_admin.tera.clone();
+    tera.load_from_glob(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/chat_support/templates/*.html"
+    ))
     .unwrap();
+
+    let app = actix_admin_builder
+        .get_scope()
+        .layer(Extension(Arc::new(tera)))
+        .layer(Extension(Arc::new(actix_admin)))
+        .layer(Extension(conn))
+        .layer(tower_sessions::SessionManagerLayer::new(
+            tower_sessions::MemoryStore::default(),
+        ))
+        .layer(tower_http::trace::TraceLayer::new_for_http());
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:5000")
+        .await
+        .expect("Can not bind to port 5000");
+    axum::serve(listener, app).await.unwrap();
 }

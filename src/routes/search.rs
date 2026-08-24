@@ -1,11 +1,16 @@
+use super::helpers::run_local;
 use super::list::replace_regex;
 use super::RoutePrelude;
 use crate::admin_prelude;
 use crate::prelude::*;
-use actix_session::Session;
-use actix_web::{error, web, Error, HttpRequest, HttpResponse};
+use axum::extract::RawQuery;
+use axum::http::HeaderMap;
+use axum::response::{IntoResponse, Response};
+use axum::{Extension, Json};
 use sea_orm::DatabaseConnection;
 use serde_derive::{Deserialize, Serialize};
+use std::sync::Arc;
+use tower_sessions::Session;
 
 #[derive(Serialize)]
 struct LabelValue {
@@ -26,16 +31,40 @@ pub struct SearchParam {
 
 pub async fn search<E: ActixAdminViewModelTrait>(
     session: Session,
-    req: HttpRequest,
-    data: web::Data<ActixAdmin>,
-    db: web::Data<DatabaseConnection>,
-) -> Result<HttpResponse, Error> {
-    let db = db.get_ref();
-    let actix_admin = data.get_ref();
-    let ctx = admin_prelude!(&session, &req, actix_admin, RoutePrelude::view(), E);
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+    Extension(actix_admin): Extension<Arc<ActixAdmin>>,
+    Extension(db): Extension<DatabaseConnection>,
+) -> Result<Response, ActixAdminError> {
+    run_local(search_inner::<E>(
+        session,
+        headers,
+        raw_query,
+        actix_admin,
+        db,
+    ))
+}
 
-    let search_query: SearchParam =
-        serde_urlencoded::from_str(req.query_string()).unwrap_or_default();
+async fn search_inner<E: ActixAdminViewModelTrait>(
+    session: Session,
+    headers: HeaderMap,
+    raw_query: Option<String>,
+    actix_admin: Arc<ActixAdmin>,
+    db: DatabaseConnection,
+) -> Result<Response, ActixAdminError> {
+    let db = &db;
+    let actix_admin = &actix_admin;
+    let raw_query = raw_query.unwrap_or_default();
+    let ctx = admin_prelude!(
+        &session,
+        &headers,
+        &raw_query,
+        actix_admin,
+        RoutePrelude::view(),
+        E
+    );
+
+    let search_query: SearchParam = serde_urlencoded::from_str(&raw_query).unwrap_or_default();
 
     let params = ActixAdminViewModelParams {
         page: None,
@@ -63,8 +92,8 @@ pub async fn search<E: ActixAdminViewModelTrait>(
                 })
                 .collect()
         }
-        Err(e) => return Err(error::ErrorInternalServerError(e.to_string())),
+        Err(e) => return Err(ActixAdminError::internal(e.to_string())),
     };
 
-    Ok(HttpResponse::Ok().json(SearchList { items: entities }))
+    Ok(Json(SearchList { items: entities }).into_response())
 }
